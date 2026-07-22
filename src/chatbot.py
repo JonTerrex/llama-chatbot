@@ -2,88 +2,127 @@ import argparse
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig # Importamos BitsAndBytesConfig para la configuración de carga en 4 bits
 
-def generar_respuesta(prompt: str, path_modelo: str) -> str:
+def inicializar_modelo_y_tokenizador(path_modelo: str):
     """
-    Carga el modelo en GPU usando CUDA, procesa el prompt y retorna la respuesta.
-    prompt: Mensaje de entrada del usuario.
-    path_modelo: Ruta local donde se encuentra el modelo Llama 3.
+    Inicializa el hardware de Nvidia CUDA y carga el modelo Llama 3 cuantizado a 4 bits.
+    Se ejecuta una sola vez al arrancar la aplicación (Cold Start).
     """
     print("[INFO] Cargando tokenizador...")
-    # Cargamos el tokenizador desde la ruta local del modelo
-    tokenizer = AutoTokenizer.from_pretrained(path_modelo) 
-    
+    tokenizer = AutoTokenizer.from_pretrained(path_modelo)
+
     print("[INFO] Configurando cuantización de 4 bits...")
-    # Creamos el objeto de configuración moderno que exige transformers
     configuracion_4bit = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4" # NormalFloat4, optimizado para modelos como Llama
+        bnb_4bit_quant_type="nf4"
     )
-    
-    print("[INFO] Cargando modelo en GPU con CUDA (bfloat16)...")
-    # Cargamos con torch_dtype=torch.bfloat16 y device_map="cuda" para forzar el uso de la GPU
+
+    print("[INFO] Cargando modelo en GPU con CUDA (4 bits)...")
     model = AutoModelForCausalLM.from_pretrained(
-        path_modelo, # Cargamos el modelo desde la ruta local
-        dtype=torch.bfloat16, # Usamos bfloat16 para optimizar el uso de memoria
-        device_map="cuda", # Asignamos automáticamente el modelo a la GPU compatible con CUDAdisponible
-        quantization_config=configuracion_4bit # Aplicamos la configuración de cuantización de 4 bits para reducir el uso de memoria y mejorar la velocidad de inferencia
+        path_modelo,
+        quantization_config=configuracion_4bit,
+        device_map="cuda"
     )
     
-    # Estructura del prompt usando la plantilla oficial de Llama 3 Instruct
-    mensajes = [
-        {"role": "system", "content": "Sos un asistente de IA muy conciso y profesional."},
-        {"role": "user", "content": prompt}
-    ]
-    # Aplicar la plantilla de chat del modelo y obtener los input_ids directamente
+    # Devolvemos los dos objetos cargados en la memoria de la GPU
+    return model, tokenizer
+
+
+def generar_respuesta(historial: list, model, tokenizer) -> str:
+    """
+    Genera una respuesta del modelo Llama 3 Instruct basado en el historial de conversación.
+    
+    """
+    # 1. Aplicamos la plantilla de chat del modelo y obtenemos los input_ids directamente
     inputs = tokenizer.apply_chat_template(
-        mensajes,
+        historial,
         add_generation_prompt=True, # Agrega un prompt de generación para que el modelo sepa que debe responder
         return_tensors="pt", # Convertimos la entrada a tensores de PyTorch
         return_dict=True  # Nos asegura el formato correcto estructurado
     )
-    
-    # Extraemos explícitamente los ID de los tokens y los enviamos a la GPU
-    input_ids = inputs["input_ids"].to("cuda") # Enviamos los tensores de entrada a la GPU
-    
+    #2. Enviamos el diccionario de tensores a la GPU para acelerar la inferencia
+    inputs = {k: v.to("cuda") for k, v in inputs.items()} 
+
     print("[INFO] Generando respuesta...")
-    # Configuración de generación optimizada para producción
+    # 3. Configuramos de forma segura el token_pad_id para evitar advertencias de padding en la generación
+    #tokenizer.pad_token_id = tokenizer.eos_token_id    
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    
+    # 4. Pasamos todos los tensores al modelo para generar la respuesta
     outputs = model.generate(
-        input_ids,
+        **inputs, # desempaquetamos los inputs y attention mask juntos
         max_new_tokens=256, # Limita la cantidad de tokens generados para evitar respuestas demasiado largas
         do_sample=True, # Permite la generación de texto con cierta aleatoriedad
         temperature=0.6, # Controla la aleatoriedad de la generación
         top_p=0.9, # Filtra los tokens más probables para mantener coherencia
-        eos_token_id=tokenizer.eos_token_id # Indica al modelo cuándo detener la generación
+        eos_token_id=tokenizer.eos_token_id, # Indica al modelo cuándo detener la generación
+        pad_token_id=pad_token_id # silencia la advertencia de padding y evita errores de longitud
     )
     
-    # Decodificar solo los tokens nuevos generados por el modelo
-    respuesta_tokens = outputs[0][input_ids.shape[-1]:]
+    # 5. Decodificar solo los tokens nuevos generados por el modelo
+    input_length = inputs["input_ids"].shape[-1]
+    respuesta_tokens = outputs[0][input_length:]
     respuesta_texto = tokenizer.decode(respuesta_tokens, skip_special_tokens=True)
     
     return respuesta_texto
 
 def main():
-    # Configuración del parser de argumentos para recibir el prompt desde la línea de comandos
-    parser = argparse.ArgumentParser(
-        description="Chatbot profesional utilizando Meta-Llama-3-8B-Instruct local con soporte CUDA."
-    )
-    # Agregamos un argumento obligatorio para el prompt
-    parser.add_argument(
-        "prompt", 
-        type=str, 
-        help="El mensaje o pregunta que le vas a enviar al modelo Llama 3."
-    )
-    args = parser.parse_args()
-    
+
     # Ruta local donde descargamos el modelo en el paso anterior
     PATH_MODELO = "modelos/llama3"
-    
+    model, tokenizer = inicializar_modelo_y_tokenizador(PATH_MODELO)
     try:
+        """
         # Generamos la respuesta del modelo usando el prompt proporcionado
-        resultado = generar_respuesta(args.prompt, PATH_MODELO) 
+        resultado = generar_respuesta(args.prompt, model, tokenizer)
         print("\n=== RESPUESTA DEL CHATBOT ===")
         print(resultado)
-        print("=============================\n")
+        print("=============================\n")"""
+        
+        # Inicializamos el historial con las directivas del sistema (System Prompt)
+        historial_conversacion = [
+            {"role": "system", "content": "Sos un asistente de IA muy conciso, profesional y servicial."}
+        ]
+        
+        print("\n🤖 ¡Chatbot Activo! Escribí 'salir' para finalizar.\n")
+        
+        # Iniciamos el bucle interactivo continuo
+        while True:
+            # Capturamos lo que el usuario escribe en tiempo real
+            user_input = input("Tú > ")
+            
+            # Condición de quiebre: si escribe 'salir', romper el bucle
+            if user_input.lower() in ['salir', 'exit', 'chau']:
+                print("🤖 ¡Hasta luego!")
+                break
+                
+            # Si el usuario le da al Enter sin escribir nada, salteamos la vuelta
+            if not user_input.strip():
+                continue
+            # Agregamos el nuevo mensaje del usuario al historial acumulativo
+            historial_conversacion.append({"role": "user", "content": user_input})
+            
+            # Modificamos temporalmente el eco para verificar que la memoria acumula bien
+            print(f"Historial actual (Tokens guardados): {len(historial_conversacion)} mensajes en memoria.\n")    
+            # Imprimimos un eco temporal para verificar que el bucle está vivo
+            print(f"Llama 3 (Prueba) > Recibí tu mensaje: '{user_input}'\n")
+
+            # Llamamos a la función para generar la respuesta del modelo
+            try:
+                # 2. Llamamos a la función enviándole el historial y la ruta del modelo
+                respuesta = generar_respuesta(historial_conversacion, model, tokenizer)
+                
+                # 3. Imprimimos la respuesta oficial en la pantalla
+                print(f"\nLlama 3 > {respuesta}\n")
+                
+                # 4. CRUCIAL: Guardamos la respuesta del bot con rol 'assistant' para el próximo turno
+                historial_conversacion.append({"role": "assistant", "content": respuesta})
+            # Capturamos cualquier excepción que ocurra durante la generación de la respuesta
+            except Exception as e:
+                import traceback
+                print("\n[ERROR] Ocurrió un fallo al generar la respuesta:")
+                traceback.print_exc()
+    # Capturamos cualquier excepción que ocurra durante la ejecución del programa
     except Exception as e:
         import traceback
         print("\n[ERROR] Ocurrió un fallo en la ejecución:")
