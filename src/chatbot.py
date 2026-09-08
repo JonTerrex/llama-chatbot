@@ -1,4 +1,3 @@
-import argparse
 import torch
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig # Importamos BitsAndBytesConfig para la configuración de carga en 4 bits
@@ -25,6 +24,7 @@ def cargar_system_prompt(nombre_archivo: str = "system_prompt.txt") -> str:
             return "Sos un asistente de IA muy conciso, profesional y servicial."
             
         print(f"[INFO] System Prompt cargado exitosamente desde: {ruta_prompt.name}")
+        # 4. Retornamos el contenido del System Prompt
         return contenido
 
     except FileNotFoundError:
@@ -38,16 +38,29 @@ def inicializar_modelo_y_tokenizador(path_modelo: str):
     Inicializa el hardware de Nvidia CUDA y carga el modelo Llama 3 cuantizado a 4 bits.
     Se ejecuta una sola vez al arrancar la aplicación (Cold Start).
     """
+    #1. Verificamos si CUDA está disponible en el sistema
+    if not torch.cuda.is_available():
+        raise RuntimeError("[ERROR] CUDA no está disponible. Asegúrate de tener una GPU compatible y los controladores instalados.")
+    #2. Mostramos información sobre la GPU disponible
+    print(f"[INFO] GPU disponible: {torch.cuda.get_device_name(0)}")
+    print(f"[INFO] Arquitectura de la GPU: {torch.cuda.get_device_properties(0).name}, Memoria total: {torch.cuda.get_device_properties(0).total_memory / (1024 ** 3):.2f} GB")
+        
+    #3. Mostramos la versión de PyTorch y CUDA para depuración
+    print(f"[INFO] Versión de PyTorch: {torch.__version__}, Versión de CUDA: {torch.version.cuda}")
+    #4. Mostramos la ruta del modelo que se va a cargar
+    print(f"[INFO] Cargando modelo desde: {path_modelo}")
+
+    #5. Cargamos el tokenizador desde la ruta del modelo 
     print("[INFO] Cargando tokenizador...")
     tokenizer = AutoTokenizer.from_pretrained(path_modelo)
-
+    # 6. Configuramos la cuantización de 4 bits para el modelo
     print("[INFO] Configurando cuantización de 4 bits...")
     configuracion_4bit = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_quant_type="nf4"
     )
-
+    # 7. Cargamos el modelo en la GPU con la configuración de cuantización
     print("[INFO] Cargando modelo en GPU con CUDA (4 bits)...")
     model = AutoModelForCausalLM.from_pretrained(
         path_modelo,
@@ -55,7 +68,7 @@ def inicializar_modelo_y_tokenizador(path_modelo: str):
         device_map="cuda"
     )
     
-    # Devolvemos los dos objetos cargados en la memoria de la GPU
+    # 8. Devolvemos los dos objetos cargados en la memoria de la GPU
     return model, tokenizer
 
 
@@ -97,71 +110,3 @@ def generar_respuesta(historial: list, model, tokenizer) -> str:
     
     return respuesta_texto
 
-def main():
-    """
-    Función principal que inicia el chatbot, carga el modelo y el tokenizador, y gestiona la interacción con el usuario.
-    """
-    
-    PATH_MODELO = "modelos/llama3"# Ruta local donde descargamos el modelo en el paso anterior
-    try:
-        """
-        # Generamos la respuesta del modelo usando el prompt proporcionado
-        # y el historial de conversación acumulado.
-        """
-        # 1. Carga del modelo (Cold Start)
-        model, tokenizer = inicializar_modelo_y_tokenizador(PATH_MODELO)
-        # Inicializamos el historial con las directivas del sistema (System Prompt)
-        
-        # 2. Cargamos el System Prompt dinámicamente desde el archivo externo .txt
-        system_prompt = cargar_system_prompt("system_prompt.txt")
-        print("\n🤖 ¡Nueva personalidad cargada! \n")
-
-        # 3. inicializamos el historial de conversación con el System Prompt
-        historial_conversacion = [
-                {"role": "system", "content": system_prompt}
-        ]
-              
-        print("\n🤖 ¡Chatbot Activo! Escribí 'salir' para finalizar.\n")
-        
-        # 4. Iniciamos el bucle interactivo continuo
-        while True:
-            
-            # 5. Capturamos la entrada del usuario
-            user_input = input("Tú > ")
-            
-            # 6. Verificamos si el usuario quiere salir del chat
-            if user_input.lower() in ['salir', 'exit', 'chau']:
-                print("🤖 ¡Hasta luego!")
-                break
-                
-            # 7. Ignoramos entradas vacías para evitar errores en la generación de respuestas
-            if not user_input.strip():
-                continue
-            
-            # 8. Guardamos la entrada del usuario con rol 'user' para la proxima generación de respuesta
-            historial_conversacion.append({"role": "user", "content": user_input})
-            
-            # 9. Intentamos generar la respuesta del modelo y manejar cualquier excepción que pueda ocurrir
-            try:
-                # 10. Generamos la respuesta del modelo usando el historial de conversación acumulado
-                respuesta = generar_respuesta(historial_conversacion, model, tokenizer)
-                
-                # 11. Mostramos la respuesta generada por el modelo en la consola
-                print(f"\nLlama 3 > {respuesta}\n")
-                
-                # 12. CRUCIAL: Guardamos la respuesta del bot con rol 'assistant' para el próximo turno
-                historial_conversacion.append({"role": "assistant", "content": respuesta})
-            
-            # 13. Capturamos cualquier excepción que ocurra durante la generación de la respuesta
-            except Exception as e:
-                import traceback
-                print("\n[ERROR] Ocurrió un fallo al generar la respuesta:")
-                traceback.print_exc()
-    # 14.Capturamos cualquier excepción que ocurra durante la ejecución del programa
-    except Exception as e:
-        import traceback
-        print("\n[ERROR] Ocurrió un fallo en la ejecución:")
-        traceback.print_exc() # Imprimimos el traceback completo del error para facilitar la depuración
-    
-if __name__ == "__main__":
-    main()
