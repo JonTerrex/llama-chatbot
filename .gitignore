@@ -7,3 +7,5 @@ __pycache__/
 
 # Archivos de entorno y configuraciones locales
 .env
+#  carpetas de modelos
+modelos/
