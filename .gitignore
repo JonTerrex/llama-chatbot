@@ -1,11 +1,16 @@
-﻿# Caché de Python
+﻿# Entorno virtual
+.venv/
+env/
+venv/
+
+# Pesos del modelo y datos pesados
+modelos/
+*.bin
+*.safetensors
+*.pth
+
+# Caché de Python y VS Code
 __pycache__/
 *.pyc
-
-# Entorno Virtual
-.venv/
-
-# Archivos de entorno y configuraciones locales
-.env
-#  carpetas de modelos
-modelos/
+.vscode/
+.idea/
