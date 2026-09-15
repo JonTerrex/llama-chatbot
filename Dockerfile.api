@@ -1,0 +1,20 @@
+# 1. Imagen base oficial de Python (versión ligera)
+FROM python:3.12-slim
+
+# 2. Definir el directorio de trabajo dentro del contenedor
+WORKDIR /app
+
+# 3. Copiar primero las dependencias para optimizar la caché de capas
+COPY requirements.txt .
+
+# 4. Instalar las dependencias sin guardar caché de pip para reducir tamaño
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements.txt
+
+# 5. Copiar el código fuente de la aplicación
+COPY src/ ./src
+
+# 6. Declarar el puerto interno que expondrá la API
+EXPOSE 8080
+
+# 7. Comando de arranque: FastAPI escuchando en el puerto interno 8080
+CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8080"]
