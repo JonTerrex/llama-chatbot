@@ -68,40 +68,58 @@ def cargar_system_prompt(nombre_archivo: str = "system_prompt.txt") -> str:
 
 def inicializar_modelo_y_tokenizador(path_modelo: str):
     """
-    Inicializa el hardware de Nvidia CUDA y carga el modelo Llama 3 cuantizado a 4 bits.
+    Inicializa el modelo evaluando dinámicamente las capacidades del sistema.
+    Aplica cuantización en GPU si hay VRAM suficiente, o fallback a CPU.
     Se ejecuta una sola vez al arrancar la aplicación (Cold Start).
     """
-    #1. Verificamos si CUDA está disponible en el sistema
-    if not torch.cuda.is_available():
-        raise RuntimeError("[ERROR] CUDA no está disponible. Asegúrate de tener una GPU compatible y los controladores instalados.")
-    #2. Mostramos información sobre la GPU disponible
-    print(f"[INFO] GPU disponible: {torch.cuda.get_device_name(0)}")
-    print(f"[INFO] Arquitectura de la GPU: {torch.cuda.get_device_properties(0).name}, Memoria total: {torch.cuda.get_device_properties(0).total_memory / (1024 ** 3):.2f} GB")
-        
-    #3. Mostramos la versión de PyTorch y CUDA para depuración
-    print(f"[INFO] Versión de PyTorch: {torch.__version__}, Versión de CUDA: {torch.version.cuda}")
-    #4. Mostramos la ruta del modelo que se va a cargar
-    print(f"[INFO] Cargando modelo desde: {path_modelo}")
-
-    #5. Cargamos el tokenizador desde la ruta del modelo 
-    print("[INFO] Cargando tokenizador...")
-    tokenizer = AutoTokenizer.from_pretrained(path_modelo)
-    # 6. Configuramos la cuantización de 4 bits para el modelo
-    print("[INFO] Configurando cuantización de 4 bits...")
-    configuracion_4bit = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4"
-    )
-    # 7. Cargamos el modelo en la GPU con la configuración de cuantización
-    print("[INFO] Cargando modelo en GPU con CUDA (4 bits)...")
-    model = AutoModelForCausalLM.from_pretrained(
-        path_modelo,
-        quantization_config=configuracion_4bit,
-        device_map="cuda"
-    )
+    #1. verificamos las capacidades del sistema antes de cargar el modelo
+    caps = get_system_capabilities()
+    print(f"\n[INFO] Evaluando capacidades del sistema para el Cold Start:")
+    print(f"       - RAM disponible: {caps['ram_available_gb']} GB")
+    print(f"       - GPU detectada: {caps['has_gpu']} ({caps['gpu_name'] or 'N/A'})")
+    # 2. verificamos si hay GPU y mostramos la VRAM disponible
+    if caps['has_gpu']:
+        print(f"       - VRAM libre: {caps['vram_gb']} GB")
+    # 3. guardrail de seguridad para prevenir que el modelo se cargue en sistemas con recursos insuficientes
+    MIN_RAM_REQUIRED_GB = 8.0
+    if not caps['has_gpu'] and caps['ram_available_gb'] < MIN_RAM_REQUIRED_GB:
+        raise RuntimeError(
+            f"[ERROR CRÍTICO] Recursos insuficientes. Se requieren al menos {MIN_RAM_REQUIRED_GB} GB "
+            f"de RAM libre para ejecutar en CPU, pero solo se detectaron {caps['ram_available_gb']} GB."
+        )
     
-    # 8. Devolvemos los dos objetos cargados en la memoria de la GPU
+    # 4. cargamos el tokenizador desde la ruta del modelo, independientemente de la estrategia de carga
+    print(f"[INFO] Cargando tokenizador desde: {path_modelo}")
+    tokenizer = AutoTokenizer.from_pretrained(path_modelo)
+
+    # 5. Decisión de estrategia de carga, dependiendo de la disponibilidad de GPU y VRAM
+    if caps['has_gpu'] and caps['vram_gb'] >= 5.0:
+        print(f"[INFO] Arquitectura de la GPU: {torch.cuda.get_device_properties(0).name}, Memoria total: {torch.cuda.get_device_properties(0).total_memory / (1024 ** 3):.2f} GB")
+        # Estrategia de carga en GPU con cuantización a 4 bits (NF4)
+        print("[INFO] Estrategia seleccionada: CUDA GPU con cuantización a 4 bits (NF4).")
+        # Mostramos la versión de PyTorch y CUDA para depuración
+        print(f"[INFO] Versión de PyTorch: {torch.__version__}, Versión de CUDA: {torch.version.cuda}")
+        configuracion_4bit = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4"
+        )
+        # 6. Cargamos el modelo en GPU con la configuración de cuantización a 4 bits
+        model = AutoModelForCausalLM.from_pretrained(
+            path_modelo,
+            quantization_config=configuracion_4bit,
+            device_map="cuda"
+        )
+    else:
+        # 7. Estrategia de fallback a CPU con precisión Float32
+        print("[ADVERTENCIA] GPU no disponible o VRAM insuficiente. Ejecutando fallback en CPU (Float32)...")
+        model = AutoModelForCausalLM.from_pretrained(
+            path_modelo,
+            dtype=torch.float32,
+            device_map="cpu"
+        )
+
+    # 8. Devolvemos los dos objetos cargados en la memoria
     return model, tokenizer
 
 
@@ -117,8 +135,8 @@ def generar_respuesta(historial: list, model, tokenizer) -> str:
         return_tensors="pt", # Convertimos la entrada a tensores de PyTorch
         return_dict=True  # Nos asegura el formato correcto estructurado
     )
-    #2. Enviamos el diccionario de tensores a la GPU para acelerar la inferencia
-    inputs = {k: v.to("cuda") for k, v in inputs.items()} 
+    # 2. Enviamos el diccionario de tensores al mismo dispositivo donde reside el modelo (cuda o cpu)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     print("[INFO] Generando respuesta...")
     # 3. Configuramos de forma segura el token_pad_id para evitar advertencias de padding en la generación
