@@ -1,7 +1,40 @@
 import torch
+import psutil
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig # Importamos BitsAndBytesConfig para la configuración de carga en 4 bits
+from typing import TypedDict, Optional
 
+
+class SystemCapabilities(TypedDict):
+    has_gpu: bool
+    gpu_name: Optional[str]
+    vram_gb: float
+    ram_available_gb: float
+
+
+def get_system_capabilities() -> SystemCapabilities:
+    """
+    Inspecciona el hardware del sistema (GPU/VRAM y RAM) para determinar
+    el presupuesto de memoria disponible antes de cargar un modelo.
+    """
+    ram_bytes = psutil.virtual_memory().available
+    ram_gb = round(ram_bytes / (1024 ** 3), 2)
+    
+    has_gpu = torch.cuda.is_available()
+    gpu_name: Optional[str] = None
+    vram_gb: float = 0.0
+
+    if has_gpu:
+        gpu_name = torch.cuda.get_device_name(0)
+        free_vram_bytes, _ = torch.cuda.mem_get_info(0)
+        vram_gb = round(free_vram_bytes / (1024 ** 3), 2)
+
+    return {
+        "has_gpu": has_gpu,
+        "gpu_name": gpu_name,
+        "vram_gb": vram_gb,
+        "ram_available_gb": ram_gb
+    }
 
 def cargar_system_prompt(nombre_archivo: str = "system_prompt.txt") -> str:
     """
