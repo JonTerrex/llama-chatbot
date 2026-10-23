@@ -1,0 +1,28 @@
+name: CI Pipeline - Llama Chatbot
+
+on:
+  push:
+    branches: [ "main", "feature/streamlit-client" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 1. Checkout del código
+      uses: actions/checkout@v4
+
+    - name: 2. Configurar entorno uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        version: "latest"
+
+    - name: 3. Instalar dependencias con uv
+      run: |
+        uv pip install --system fastapi uvicorn streamlit requests psutil pytest httpx pytest-mock
+
+    - name: 4. Ejecutar Suite de Pruebas (Pytest)
+      run: |
+        pytest tests/
