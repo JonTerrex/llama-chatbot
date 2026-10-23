@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import requests
 
@@ -12,7 +13,7 @@ st.title("🤖 Llama 3 Interactive Assistant")
 st.caption("Interfaz conectada a la API REST de FastAPI con cuantización a 4 bits.")
 
 # URL de la API de FastAPI y configuración de tiempo de espera para las solicitudes HTTP
-API_URL = "http://127.0.0.1:8000/v1/chat"
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000/v1/chat")
 DEFAULT_TIMEOUT = 120  # Tiempo de espera por defecto para la respuesta de la API en segundos
 
 # --- PANEL LATERAL (SIDEBAR) ---
