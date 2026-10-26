@@ -14,3 +14,5 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
+ #notas locales no versionar
+claude.md
