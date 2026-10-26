@@ -1,41 +1,37 @@
 # ==========================================
-# STAGE 1: Builder (Compilación y dependencias)
+# STAGE 1: Builder
 # ==========================================
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
-# Copiar el binario de uv directamente desde la imagen oficial
-COPY --from=astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Forzamos a uv a usar el Python del sistema base para evitar symlinks rotos
+ENV UV_PYTHON_PREFERENCE=only-system
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
 
 WORKDIR /app
 
-# Copiamos solo el requirements primero para aprovechar la caché de Docker
-COPY requirements.txt .
+COPY pyproject.toml uv.lock ./
 
-# Generamos el entorno virtual e instalamos dependencias a velocidad extrema
-RUN uv venv /app/.venv
-RUN uv pip install --python /app/.venv -r requirements.txt
+# Sincronizamos las dependencias en /app/.venv utilizando /usr/local/bin/python
+RUN uv sync --frozen --no-dev --no-install-project
 
 # ==========================================
-# STAGE 2: Runner (Imagen final de producción)
+# STAGE 2: Runner
 # ==========================================
-FROM python:3.11-slim
-
+FROM python:3.12-slim
 WORKDIR /app
 
-# Copiamos el entorno virtual compilado desde el Stage 1
+# Copiamos el entorno virtual cuyo intérprete existe en esta misma imagen base
 COPY --from=builder /app/.venv /app/.venv
 
-# Copiamos el código fuente de la aplicación
 COPY src/ /app/src/
 COPY prompts/ /app/prompts/
 
-# Inyectamos el .venv en el PATH del sistema para no tener que activarlo
 ENV PATH="/app/.venv/bin:$PATH"
-# Definimos variable de entorno para desactivar el Mock en producción si se requiere
-ENV USE_MOCK="false" 
+ENV USE_MOCK="false"
 
-# Exponemos el puerto de FastAPI
 EXPOSE 8000
 
-# Comando de arranque inyectando la IP 0.0.0.0 para habilitar tráfico externo al contenedor
 CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]

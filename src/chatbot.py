@@ -1,8 +1,8 @@
-import torch
-import psutil
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig # Importamos BitsAndBytesConfig para la configuración de carga en 4 bits
 from typing import TypedDict, Optional
+
+# torch, psutil y transformers se importan dentro de las funciones (imports diferidos)
+# para que el módulo pueda importarse sin GPU ni dependencias pesadas (modo MOCK y CI).
 
 
 class SystemCapabilities(TypedDict):
@@ -17,6 +17,9 @@ def get_system_capabilities() -> SystemCapabilities:
     Inspecciona el hardware del sistema (GPU/VRAM y RAM) para determinar
     el presupuesto de memoria disponible antes de cargar un modelo.
     """
+    import psutil
+    import torch
+
     ram_bytes = psutil.virtual_memory().available
     ram_gb = round(ram_bytes / (1024 ** 3), 2)
     
@@ -72,6 +75,9 @@ def inicializar_modelo_y_tokenizador(path_modelo: str):
     Aplica cuantización en GPU si hay VRAM suficiente, o fallback a CPU.
     Se ejecuta una sola vez al arrancar la aplicación (Cold Start).
     """
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
     #1. verificamos las capacidades del sistema antes de cargar el modelo
     caps = get_system_capabilities()
     print(f"\n[INFO] Evaluando capacidades del sistema para el Cold Start:")

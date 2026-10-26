@@ -14,12 +14,22 @@ st.caption("Interfaz conectada a la API REST de FastAPI con cuantización a 4 bi
 
 # URL de la API de FastAPI y configuración de tiempo de espera para las solicitudes HTTP
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000/v1/chat")
-DEFAULT_TIMEOUT = 120  # Tiempo de espera por defecto para la respuesta de la API en segundos
+HEALTH_URL = API_URL.rsplit("/v1/", 1)[0] + "/health"
+DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", 120))  # Tiempo de espera por defecto para la respuesta de la API en segundos
 
 # --- PANEL LATERAL (SIDEBAR) ---
 with st.sidebar:
     st.header("⚙️ Configuración del Bot")
-    st.info("Modelo: **Llama 3 (4-bit quantization)**")
+    try:
+        backend = requests.get(HEALTH_URL, timeout=5).json().get("backend")
+    except Exception:
+        backend = None
+    if backend == "mock":
+        st.warning("Backend: **MOCK** (respuestas simuladas, sin LLM)")
+    elif backend:
+        st.info(f"Backend: **{backend}** (local, 4-bit)")
+    else:
+        st.error("API no disponible")
     
     # Botón para reiniciar la conversación
     if st.button("🗑️ Limpiar Historial", use_container_width=True):
@@ -48,10 +58,10 @@ if prompt := st.chat_input("Escribí tu mensaje aquí..."):
 
     # 4. Enviamos el historial completo a la API REST de FastAPI
     with st.chat_message("assistant"):
-        with st.spinner("Pensando respuesta en GPU..."):
+        with st.spinner("Generando respuesta..."):
             try:
                 payload = {"historial": st.session_state.messages}
-                response = requests.post(API_URL, json=payload, timeout=60)
+                response = requests.post(API_URL, json=payload, timeout=DEFAULT_TIMEOUT)
                 
                 if response.status_code == 200:
                     respuesta_texto = response.json().get("respuesta", "")
@@ -63,6 +73,6 @@ if prompt := st.chat_input("Escribí tu mensaje aquí..."):
                     st.error(error_msg)
 
             except requests.exceptions.ConnectionError:
-                st.error("No se pudo conectar con la API de FastAPI. ¿Está el servidor corriendo en http://127.0.0.1:8000?")
+                st.error(f"No se pudo conectar con la API en {API_URL}. ¿Está el servidor corriendo?")
             except Exception as e:
                 st.error(f"Ocurrió un error inesperado: {str(e)}")
