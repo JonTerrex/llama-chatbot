@@ -1,0 +1,18 @@
+services:
+  api:
+    image: llama-chatbot-api-gpu
+    build:
+      args:
+        UV_GROUP: gpu
+    environment:
+      - USE_MOCK=false
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./modelos:/app/modelos:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
