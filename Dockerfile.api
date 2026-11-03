@@ -1,20 +1,38 @@
-# 1. Imagen base oficial de Python (versión ligera)
-FROM python:3.12-slim
+# ==========================================
+# STAGE 1: Builder
+# ==========================================
+FROM python:3.12-slim AS builder
 
-# 2. Definir el directorio de trabajo dentro del contenedor
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Forzamos a uv a usar el Python del sistema base para evitar symlinks rotos
+ENV UV_PYTHON_PREFERENCE=only-system
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
+
 WORKDIR /app
 
-# 3. Copiar primero las dependencias para optimizar la caché de capas
-COPY requirements.txt .
+COPY pyproject.toml uv.lock ./
+# definimos un argumento opcional para el grupo de dependencias a instalar
+ARG UV_GROUP=""
+# Sincronizamos las dependencias en /app/.venv utilizando /usr/local/bin/python
+RUN uv sync --frozen --no-dev --no-install-project ${UV_GROUP:+--group $UV_GROUP}
 
-# 4. Instalar las dependencias sin guardar caché de pip para reducir tamaño
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements.txt
+# ==========================================
+# STAGE 2: Runner
+# ==========================================
+FROM python:3.12-slim
+WORKDIR /app
 
-# 5. Copiar el código fuente de la aplicación
-COPY src/ ./src
+# Copiamos el entorno virtual cuyo intérprete existe en esta misma imagen base
+COPY --from=builder /app/.venv /app/.venv
 
-# 6. Declarar el puerto interno que expondrá la API
-EXPOSE 8080
+COPY src/ /app/src/
+COPY prompts/ /app/prompts/
 
-# 7. Comando de arranque: FastAPI escuchando en el puerto interno 8080
-CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8080"]
+ENV PATH="/app/.venv/bin:$PATH"
+ENV USE_MOCK="false"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]

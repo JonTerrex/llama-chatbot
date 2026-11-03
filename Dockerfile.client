@@ -1,0 +1,31 @@
+# ==========================================
+# STAGE 1: Builder
+# ==========================================
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_PYTHON_PREFERENCE=only-system
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+
+RUN uv sync --frozen --no-dev --no-install-project
+
+# ==========================================
+# STAGE 2: Runner
+# ==========================================
+FROM python:3.12-slim
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+COPY src/app_ui.py /app/src/app_ui.py
+
+ENV PATH="/app/.venv/bin:$PATH"
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "src/app_ui.py", "--server.port=8501", "--server.address=0.0.0.0"]

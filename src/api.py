@@ -1,10 +1,18 @@
+import os
+import time
 from contextlib import asynccontextmanager
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
-# Importamos directamente desde el módulo chatbot para mantener la consistencia y evitar dependencias circulares
-from src.chatbot import cargar_system_prompt, inicializar_modelo_y_tokenizador, generar_respuesta
+# Importamos los módulos (no las funciones) para poder elegir backend en el arranque
+from src import chatbot, mock_llm
+from src.chatbot import cargar_system_prompt
+
+
+def usar_mock() -> bool:
+    """Lee USE_MOCK del entorno (12-Factor). Acepta true/1/yes."""
+    return os.getenv("USE_MOCK", "false").strip().lower() in ("1", "true", "yes")
 
 # Estructura del objeto global de estado para el modelo
 ml_models: Dict[str, Any] = {}
@@ -18,17 +26,21 @@ async def lifespan(app: FastAPI):
     Carga el modelo y tokenizador en VRAM al arrancar (Cold Start)
     y libera recursos al apagar el servidor.
     """
-    # 1. Mensaje informativo al iniciar el servidor
-    print("\n[INFO] Iniciando servidor API... Cargando modelo Llama 3 en GPU...")
-    path_modelo = "modelos/llama3"
+    # 1. Elegimos backend: mock (sin GPU) o modelo real
+    backend = mock_llm if usar_mock() else chatbot
+    nombre_backend = "mock" if backend is mock_llm else "llama3"
+    print(f"\n[INFO] Iniciando servidor API... Backend seleccionado: {nombre_backend}")
+    path_modelo = os.getenv("MODEL_PATH", "modelos/llama3")
     
-    # 2. Carga única en VRAM
-    model, tokenizer = inicializar_modelo_y_tokenizador(path_modelo)
+    # 2. Carga única (en VRAM si es el modelo real)
+    model, tokenizer = backend.inicializar_modelo_y_tokenizador(path_modelo)
     system_prompt = cargar_system_prompt("system_prompt.txt")
     
     ml_models["model"] = model
     ml_models["tokenizer"] = tokenizer
     ml_models["system_prompt"] = system_prompt
+    ml_models["generar"] = backend.generar_respuesta
+    ml_models["backend"] = nombre_backend
     
     print("[INFO] Modelo cargado exitosamente. Servidor listo para recibir peticiones.\n")
     yield
@@ -56,12 +68,17 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     respuesta: str = Field(..., description="Respuesta generada por el modelo Llama 3.")
+    metricas: Optional[Dict[str, Any]] = None
 
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 def health_check():
     """Endpoint de monitoreo para verificar que la API está activa."""
-    return {"status": "ok", "model_loaded": "model" in ml_models}
+    return {
+        "status": "ok",
+        "model_loaded": "model" in ml_models,
+        "backend": ml_models.get("backend"),
+    }
 
 
 @app.post("/v1/chat", response_model=ChatResponse, status_code=status.HTTP_200_OK)
@@ -81,13 +98,18 @@ def chat_endpoint(request: ChatRequest):
         if not any(msg.get("role") == "system" for msg in historial_completo):
             historial_completo.insert(0, {"role": "system", "content": ml_models["system_prompt"]})
 
-        respuesta_texto = generar_respuesta(
+        metricas: Dict[str, Any] = {}
+        t_inicio = time.perf_counter()
+        respuesta_texto = ml_models["generar"](
             historial=historial_completo,
             model=ml_models["model"],
-            tokenizer=ml_models["tokenizer"]
+            tokenizer=ml_models["tokenizer"],
+            metricas=metricas
         )
+        metricas["latencia_s"] = round(time.perf_counter() - t_inicio, 3)
+        print(f"[METRICAS] {metricas}")
         
-        return ChatResponse(respuesta=respuesta_texto)
+        return ChatResponse(respuesta=respuesta_texto, metricas=metricas)
         
     except Exception as e:
         raise HTTPException(

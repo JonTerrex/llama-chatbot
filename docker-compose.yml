@@ -1,0 +1,35 @@
+#eliminar la linea de version por estar depreciada
+#version: "3.8"
+
+services:
+  # Microservicio del Backend (FastAPI)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      # true = respuestas simuladas sin GPU. Poner false con GPU y pesos en ./modelos
+      - USE_MOCK=true
+    # Si vas a usar GPU nativa en Linux/WSL2, descomenta estas líneas:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Microservicio del Frontend (Streamlit)
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    ports:
+      - "8501:8501"
+    environment:
+      # Inyectamos la URL usando la resolución DNS interna de Docker
+      - API_URL=http://api:8000/v1/chat
+    depends_on:
+      - api
