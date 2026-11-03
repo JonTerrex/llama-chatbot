@@ -21,7 +21,7 @@ jobs:
 
     - name: 3. Instalar dependencias con uv
       run: |
-        uv pip install --system fastapi uvicorn streamlit requests psutil pytest httpx pytest-mock
+        uv pip install --system fastapi uvicorn streamlit requests psutil pytest httpx2 pytest-mock
 
     - name: 4. Ejecutar Suite de Pruebas (Pytest)
       run: |
