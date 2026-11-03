@@ -16,3 +16,14 @@ def test_api_en_modo_mock(monkeypatch):
         texto = r.json()["respuesta"]
         assert "**[MOCK]**" in texto
         assert "**Hola**" in texto
+
+
+def test_metricas_en_modo_mock(monkeypatch):
+    monkeypatch.setenv("USE_MOCK", "true")
+    from src.api import app
+
+    with TestClient(app) as client:
+        r = client.post("/v1/chat", json={"historial": [{"role": "user", "content": "Hola"}]})
+        assert r.status_code == 200
+        metricas = r.json()["metricas"]
+        assert isinstance(metricas["latencia_s"], (int, float))

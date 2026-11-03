@@ -1,6 +1,7 @@
 import os
+import time
 from contextlib import asynccontextmanager
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
@@ -67,6 +68,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     respuesta: str = Field(..., description="Respuesta generada por el modelo Llama 3.")
+    metricas: Optional[Dict[str, Any]] = None
 
 
 @app.get("/health", status_code=status.HTTP_200_OK)
@@ -96,13 +98,18 @@ def chat_endpoint(request: ChatRequest):
         if not any(msg.get("role") == "system" for msg in historial_completo):
             historial_completo.insert(0, {"role": "system", "content": ml_models["system_prompt"]})
 
+        metricas: Dict[str, Any] = {}
+        t_inicio = time.perf_counter()
         respuesta_texto = ml_models["generar"](
             historial=historial_completo,
             model=ml_models["model"],
-            tokenizer=ml_models["tokenizer"]
+            tokenizer=ml_models["tokenizer"],
+            metricas=metricas
         )
+        metricas["latencia_s"] = round(time.perf_counter() - t_inicio, 3)
+        print(f"[METRICAS] {metricas}")
         
-        return ChatResponse(respuesta=respuesta_texto)
+        return ChatResponse(respuesta=respuesta_texto, metricas=metricas)
         
     except Exception as e:
         raise HTTPException(

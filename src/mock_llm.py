@@ -22,7 +22,7 @@ def inicializar_modelo_y_tokenizador(path_modelo: str = "modelos/llama3"):
     return MOCK_MODEL, MOCK_TOKENIZER
 
 
-def generar_respuesta(historial: list, model=None, tokenizer=None) -> str:
+def generar_respuesta(historial: list, model=None, tokenizer=None, metricas: dict | None = None) -> str:
     """
     Devuelve una respuesta en Markdown (con negritas) a partir del último
     mensaje del usuario. Opcionalmente simula latencia con MOCK_LATENCY (segundos).

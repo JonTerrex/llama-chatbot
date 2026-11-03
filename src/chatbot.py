@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from typing import TypedDict, Optional
 
@@ -129,11 +130,14 @@ def inicializar_modelo_y_tokenizador(path_modelo: str):
     return model, tokenizer
 
 
-def generar_respuesta(historial: list, model, tokenizer) -> str:
+def generar_respuesta(historial: list, model, tokenizer, metricas: dict | None = None) -> str:
     """
     Genera una respuesta del modelo Llama 3 Instruct basado en el historial de conversación.
+    Si se pasa `metricas` (dict), se rellena con tokens, tokens/s y VRAM de esta generación.
     
     """
+    import torch
+
     # 1. Aplicamos la plantilla de chat del modelo y obtenemos los input_ids directamente
     inputs = tokenizer.apply_chat_template(
         historial,
@@ -150,6 +154,10 @@ def generar_respuesta(historial: list, model, tokenizer) -> str:
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     
     # 4. Pasamos todos los tensores al modelo para generar la respuesta
+    hay_cuda = model.device.type == "cuda"
+    if hay_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    t_inicio = time.perf_counter()
     outputs = model.generate(
         **inputs, # desempaquetamos los inputs y attention mask juntos
         max_new_tokens=256, # Limita la cantidad de tokens generados para evitar respuestas demasiado largas
@@ -159,11 +167,23 @@ def generar_respuesta(historial: list, model, tokenizer) -> str:
         eos_token_id=tokenizer.eos_token_id, # Indica al modelo cuándo detener la generación
         pad_token_id=pad_token_id # silencia la advertencia de padding y evita errores de longitud
     )
+    if hay_cuda:
+        torch.cuda.synchronize()  # generate es asíncrono en GPU: esperamos a que termine antes de parar el cronómetro
+    segundos_generacion = time.perf_counter() - t_inicio
     
     # 5. Decodificar solo los tokens nuevos generados por el modelo
     input_length = inputs["input_ids"].shape[-1]
     respuesta_tokens = outputs[0][input_length:]
     respuesta_texto = tokenizer.decode(respuesta_tokens, skip_special_tokens=True)
     
+    # 6. Métricas opcionales de rendimiento (solo si el llamador pasa un dict)
+    if metricas is not None:
+        tokens_generados = int(respuesta_tokens.shape[-1])
+        metricas["tokens_prompt"] = int(input_length)
+        metricas["tokens_generados"] = tokens_generados
+        metricas["tokens_por_s"] = round(tokens_generados / segundos_generacion, 2) if segundos_generacion > 0 else None
+        metricas["vram_pico_mb"] = round(torch.cuda.max_memory_allocated() / (1024 ** 2), 1) if hay_cuda else None
+        metricas["vram_reservada_mb"] = round(torch.cuda.memory_reserved() / (1024 ** 2), 1) if hay_cuda else None
+
     return respuesta_texto
 
