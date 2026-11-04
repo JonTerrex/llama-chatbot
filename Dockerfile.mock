@@ -1,0 +1,36 @@
+# ==========================================
+# STAGE 1: Builder
+# ==========================================
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_PYTHON_PREFERENCE=only-system
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+# Solo el grupo "server" (fastapi + uvicorn): el mock no necesita torch ni streamlit
+RUN uv sync --frozen --no-default-groups --group server --no-install-project
+
+# ==========================================
+# STAGE 2: Runner
+# ==========================================
+FROM python:3.12-slim
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+
+# Solo src/providers. src/__init__.py se omite a propósito: importa src.chatbot,
+# y sin él "src" funciona como paquete de espacio de nombres implícito.
+COPY src/providers/ /app/src/providers/
+
+ENV PATH="/app/.venv/bin:$PATH"
+ENV MOCK_LATENCY="0"
+ENV MOCK_HISTORY_SIZE="20"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.providers.mock.app:app", "--host", "0.0.0.0", "--port", "8000"]
