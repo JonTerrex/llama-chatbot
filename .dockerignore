@@ -2,7 +2,7 @@
 .git/
 .github/
 .pytest_cache/
-__pycache__/
-*.pyc
+**/__pycache__/
+**/*.pyc
 tests/
 modelos/
