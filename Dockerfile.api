@@ -16,8 +16,9 @@ COPY pyproject.toml uv.lock ./
 # definimos un argumento opcional para el grupo de dependencias a instalar
 ARG UV_GROUP=""
 # Sincronizamos las dependencias en /app/.venv utilizando /usr/local/bin/python
-RUN uv sync --frozen --no-dev --no-install-project ${UV_GROUP:+--group $UV_GROUP}
-
+#RUN uv sync --frozen --no-dev --no-install-project ${UV_GROUP:+--group $UV_GROUP}
+RUN uv sync --frozen --no-default-groups --group server --no-install-project ${UV_GROUP:+--group $UV_GROUP}
+#RUN uv sync --frozen --no-default-groups --group server --no-install-project ${UV_GROUP:+--group $UV_GROUP}
 # ==========================================
 # STAGE 2: Runner
 # ==========================================

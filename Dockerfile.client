@@ -8,12 +8,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 ENV UV_PYTHON_PREFERENCE=only-system
 ENV UV_LINK_MODE=copy
 ENV UV_COMPILE_BYTECODE=1
-
+#  definimos el directorio de trabajo
 WORKDIR /app
-
+# copiamos los archivos de configuración de dependencias
 COPY pyproject.toml uv.lock ./
-
-RUN uv sync --frozen --no-dev --no-install-project
+# corremos la sincronización de dependencias para el grupo "client"
+RUN uv sync --frozen --no-default-groups --group client --no-install-project
 
 # ==========================================
 # STAGE 2: Runner

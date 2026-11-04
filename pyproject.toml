@@ -7,13 +7,7 @@ authors = [
     { name = "JonTerrex", email = "juan.anuch@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = [
-    "fastapi>=0.162.0",
-    "pytest>=9.1.1",
-    "requests>=2.34.2",
-    "streamlit>=1.66.1",
-    "uvicorn>=0.54.0",
-]
+dependencies = []
 
 [project.scripts]
 llama-chatbot = "llama_chatbot:main"
@@ -23,8 +17,13 @@ requires = ["uv_build>=0.12.23,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+client = [
+    "requests>=2.34.2",
+    "streamlit>=1.66.1",
+]
 dev = [
     "httpx2>=2.16.0",
+    "pytest>=9.1.1",
 ]
 gpu = [
     "accelerate>=1.15.0",
@@ -33,6 +32,13 @@ gpu = [
     "torch>=2.15.0",
     "transformers>=5.22.1",
 ]
+server = [
+    "fastapi>=0.162.0",
+    "uvicorn>=0.54.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.uv]
+default-groups = ["dev", "server", "client"]

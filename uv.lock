@@ -532,17 +532,16 @@ wheels = [
 name = "llama-chatbot"
 version = "0.1.0"
 source = { editable = "." }
-dependencies = [
-    { name = "fastapi" },
-    { name = "pytest" },
-    { name = "requests" },
-    { name = "streamlit" },
-    { name = "uvicorn" },
-]
+default-groups = ["client", "dev", "server"]
 
 [package.dev-dependencies]
+client = [
+    { name = "requests" },
+    { name = "streamlit" },
+]
 dev = [
     { name = "httpx2" },
+    { name = "pytest" },
 ]
 gpu = [
     { name = "accelerate" },
@@ -551,24 +550,32 @@ gpu = [
     { name = "torch" },
     { name = "transformers" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "fastapi", specifier = ">=0.162.0" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "requests", specifier = ">=2.34.2" },
-    { name = "streamlit", specifier = ">=1.66.1" },
-    { name = "uvicorn", specifier = ">=0.54.0" },
+server = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
 ]
 
+[package.metadata]
+
 [package.metadata.requires-dev]
-dev = [{ name = "httpx2", specifier = ">=2.16.0" }]
+client = [
+    { name = "requests", specifier = ">=2.34.2" },
+    { name = "streamlit", specifier = ">=1.66.1" },
+]
+dev = [
+    { name = "httpx2", specifier = ">=2.16.0" },
+    { name = "pytest", specifier = ">=9.1.1" },
+]
 gpu = [
     { name = "accelerate", specifier = ">=1.15.0" },
     { name = "bitsandbytes", specifier = ">=0.50.2" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "torch", specifier = ">=2.15.0" },
     { name = "transformers", specifier = ">=5.22.1" },
+]
+server = [
+    { name = "fastapi", specifier = ">=0.162.0" },
+    { name = "uvicorn", specifier = ">=0.54.0" },
 ]
 
 [[package]]
