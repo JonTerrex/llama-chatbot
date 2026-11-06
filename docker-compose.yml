@@ -33,3 +33,15 @@ services:
       - API_URL=http://api:8000/v1/chat
     depends_on:
       - api
+
+# Proveedor simulado (solo desarrollo): expone x_debug y /debug/requests
+  mock:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock
+    profiles: ["dev"]
+    ports:
+      - "8001:8000"
+    environment:
+      - MOCK_LATENCY=0
+      - MOCK_HISTORY_SIZE=20
