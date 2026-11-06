@@ -532,7 +532,7 @@ wheels = [
 name = "llama-chatbot"
 version = "0.1.0"
 source = { editable = "." }
-default-groups = ["client", "dev", "server"]
+default-groups = ["client", "dev", "orchestrator", "server"]
 
 [package.dev-dependencies]
 client = [
@@ -549,6 +549,10 @@ gpu = [
     { name = "psutil" },
     { name = "torch" },
     { name = "transformers" },
+]
+orchestrator = [
+    { name = "httpx2" },
+    { name = "pyyaml" },
 ]
 server = [
     { name = "fastapi" },
@@ -572,6 +576,10 @@ gpu = [
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "torch", specifier = ">=2.15.0" },
     { name = "transformers", specifier = ">=5.22.1" },
+]
+orchestrator = [
+    { name = "httpx2", specifier = ">=2.16.0" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
 ]
 server = [
     { name = "fastapi", specifier = ">=0.162.0" },
