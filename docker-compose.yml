@@ -45,3 +45,19 @@ services:
     environment:
       - MOCK_LATENCY=0
       - MOCK_HISTORY_SIZE=20
+# Orquestador (desarrollo): enruta /v1/chat/completions según providers.yaml
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    profiles: ["dev"]
+    ports:
+      - "8002:8000"
+    volumes:
+      # Registro de proveedores montado, no horneado en la imagen
+      - ./providers.yaml:/app/providers.yaml:ro
+    environment:
+      # Modelo cuando la petición no trae "model"; tiene que existir en providers.yaml
+      - DEFAULT_MODEL=mock
+      # Segundos máximos esperando la respuesta del proveedor
+      - PROVIDER_TIMEOUT_S=120

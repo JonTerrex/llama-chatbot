@@ -1,0 +1,39 @@
+# ==========================================
+# STAGE 1: Builder
+# ==========================================
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_PYTHON_PREFERENCE=only-system
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+# "server" (fastapi + uvicorn) + "orchestrator" (httpx2 + pyyaml): sin torch ni streamlit
+RUN uv sync --frozen --no-default-groups --group server --group orchestrator --no-install-project
+
+# ==========================================
+# STAGE 2: Runner
+# ==========================================
+FROM python:3.12-slim
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+
+# Solo src/orchestrator. src/__init__.py se omite a propósito: importa src.chatbot,
+# y sin él "src" funciona como paquete de espacio de nombres implícito.
+COPY src/orchestrator/ /app/src/orchestrator/
+COPY prompts/ /app/prompts/
+
+# providers.yaml NO se copia: es configuración de despliegue y va montado como volumen.
+# Si falta, el orquestador no arranca (cargar_config levanta ValueError), que es lo deseado.
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PROVIDERS_FILE="/app/providers.yaml"
+ENV SYSTEM_PROMPT_FILE="/app/prompts/system_prompt.txt"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.orchestrator.app:app", "--host", "0.0.0.0", "--port", "8000"]
