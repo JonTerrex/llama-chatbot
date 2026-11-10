@@ -21,18 +21,19 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 
-  # Microservicio del Frontend (Streamlit)
+  # Frontend (Streamlit): habla con el orquestador, no con la API vieja
   client:
     build:
       context: .
       dockerfile: Dockerfile.client
+    profiles: ["dev"]
     ports:
       - "8501:8501"
     environment:
-      # Inyectamos la URL usando la resolución DNS interna de Docker
-      - API_URL=http://api:8000/v1/chat
-    depends_on:
-      - api
+      # DNS interno de Docker. El orquestador enruta al proveedor según providers.yaml
+      - API_URL=http://orchestrator:8000/v1/chat/completions
+      # Mayor que PROVIDER_TIMEOUT_S: así el 504 limpio del orquestador llega antes que el corte de la UI
+      - DEFAULT_TIMEOUT=130 # Microservicio del Frontend (Streamlit)
 
 # Proveedor simulado (solo desarrollo): expone x_debug y /debug/requests
   mock:
