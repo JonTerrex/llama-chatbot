@@ -13,7 +13,7 @@ st.title("🤖 Llama 3 Interactive Assistant")
 st.caption("Interfaz conectada a la API REST de FastAPI con cuantización a 4 bits.")
 
 # URL de la API de FastAPI y configuración de tiempo de espera para las solicitudes HTTP
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000/v1/chat")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8002/v1/chat/completions")
 HEALTH_URL = API_URL.rsplit("/v1/", 1)[0] + "/health"
 DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", 120))  # Tiempo de espera por defecto para la respuesta de la API en segundos
 
@@ -21,15 +21,15 @@ DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", 120))  # Tiempo de espera por
 with st.sidebar:
     st.header("⚙️ Configuración del Bot")
     try:
-        backend = requests.get(HEALTH_URL, timeout=5).json().get("backend")
+        estado = requests.get(HEALTH_URL, timeout=5).json().get("status")
     except Exception:
-        backend = None
-    if backend == "mock":
-        st.warning("Backend: **MOCK** (respuestas simuladas, sin LLM)")
-    elif backend:
-        st.info(f"Backend: **{backend}** (local, 4-bit)")
+        estado = None
+    if estado == "ready":
+        st.info("Orquestador: **listo**")
+    elif estado:
+        st.warning(f"Orquestador: **{estado}**")
     else:
-        st.error("API no disponible")
+        st.error("Orquestador no disponible")
     
     # Botón para reiniciar la conversación
     if st.button("🗑️ Limpiar Historial", use_container_width=True):
@@ -60,11 +60,11 @@ if prompt := st.chat_input("Escribí tu mensaje aquí..."):
     with st.chat_message("assistant"):
         with st.spinner("Generando respuesta..."):
             try:
-                payload = {"historial": st.session_state.messages}
+                payload = {"messages": st.session_state.messages}
                 response = requests.post(API_URL, json=payload, timeout=DEFAULT_TIMEOUT)
                 
                 if response.status_code == 200:
-                    respuesta_texto = response.json().get("respuesta", "")
+                    respuesta_texto = response.json()["choices"][0]["message"]["content"]
                     st.markdown(respuesta_texto)
                     # Guardamos la respuesta del asistente en el historial
                     st.session_state.messages.append({"role": "assistant", "content": respuesta_texto})
