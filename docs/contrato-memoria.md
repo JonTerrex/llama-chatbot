@@ -35,6 +35,7 @@
 ```json
 {
   "user_id": "dev-user",
+  "turn_id": "7b1f6c0e-5d0a-4c6e-9f3a-2f8e1d4b9a10",
   "messages": [
     {"role": "user", "content": "Hola"},
     {"role": "assistant", "content": "¡Hola! ¿En qué te ayudo?"}
@@ -51,7 +52,8 @@ Respuesta `201`:
 - La conversación se crea implícitamente con el primer turno ⚠️.
 - `messages[].role` ∈ `user`, `assistant`. El `system` **no se guarda**: el orquestador lo inyecta en cada pedido, así que guardarlo duplicaría y congelaría un prompt que puede cambiar.
 - **Atómico:** se guardan todos los mensajes del pedido o ninguno.
-- ❓ Idempotencia (que un reintento no duplique el turno): se resuelve con un `turn_id` al diseñar el esquema de PostgreSQL.
+- `turn_id` (UUID, obligatorio): lo genera el orquestador **una vez por pedido** e identifica el turno. Hace el guardado **idempotente**: si la conversación ya tiene mensajes con ese `turn_id`, no se guarda nada y la respuesta es `200` con `{"conversation_id": "c-123", "stored": 0}` en vez de `201`. ⚠️
+- Hoy el orquestador no reintenta guardados, así que esta garantía todavía no se usa (sección 6). **No protege** contra un cliente que envía el mismo mensaje dos veces: cada pedido tiene su propio `turn_id`.
 
 ### 3.3 Leer el historial
 
@@ -84,13 +86,60 @@ Mismo formato que el contrato de proveedores (objeto `error` con `message`, `typ
 
 | Situación | HTTP | `code` | `type` |
 |---|---|---|---|
-| Petición mal formada (JSON inválido, id con formato inválido, `limit` fuera de rango, role no permitido) | 400 | `invalid_request` | `invalid_request_error` |
+| Petición mal formada (JSON inválido, `conversation_id`, `user_id` o `turn_id` con formato inválido, `limit` fuera de rango, role no permitido) | 400 | `invalid_request` | `invalid_request_error` |
 | Ruta o método inexistente | 404 / 405 | `null` | `invalid_request_error` |
 | Base de datos no disponible | 503 | `storage_unavailable` ⚠️ | `memory_error` ⚠️ |
 | Error interno inesperado | 500 | `internal_error` ⚠️ | `memory_error` ⚠️ |
 
 - `param` nombra el campo que falló o es `null`, igual que en proveedores.
 - Los mensajes de error no incluyen contenido de mensajes ni detalles de la base de datos.
+
+### 3.6 Esquema de PostgreSQL
+
+⚠️ Diseño propio.
+
+```sql
+CREATE TABLE IF NOT EXISTS conversations (
+    user_id          text        NOT NULL,
+    conversation_id  text        NOT NULL,
+    next_seq         integer     NOT NULL DEFAULT 1,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, conversation_id),
+    CHECK (user_id         ~ '^[A-Za-z0-9_-]{1,64}$'),
+    CHECK (conversation_id ~ '^[A-Za-z0-9_-]{1,64}$')
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    user_id          text        NOT NULL,
+    conversation_id  text        NOT NULL,
+    seq              integer     NOT NULL,
+    role             text        NOT NULL CHECK (role IN ('user', 'assistant')),
+    content          text        NOT NULL,
+    turn_id          uuid        NOT NULL,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, conversation_id, seq),
+    FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations ON DELETE CASCADE,
+    UNIQUE (user_id, conversation_id, turn_id, role)
+);
+```
+
+- **Claves naturales compuestas:** `user_id` es el prefijo de toda clave e índice, así que el aislamiento entre usuarios es estructural y no depende solo del código. No existe forma de leer mensajes sin pasar por el usuario.
+- **`seq` ordena, no el timestamp:** los dos mensajes de un turno se insertan en una misma transacción y comparten `created_at`. La lectura de "los últimos N" es `ORDER BY seq DESC LIMIT N` sobre la clave primaria, y se devuelve invertida.
+- **`next_seq`** sirve para serializar los guardados concurrentes de una misma conversación.
+- **Los `CHECK`** repiten lo que ya valida el servicio (defensa en profundidad). El `role` impide guardar un `system`.
+- **`ON DELETE CASCADE`:** borrar una conversación borra sus mensajes. Todavía no hay endpoint de borrado.
+
+**Algoritmo del guardado** (una sola transacción):
+
+1. Crear la conversación si no existe (`INSERT … ON CONFLICT DO NOTHING`).
+2. Bloquear su fila y leer `next_seq` (`SELECT … FOR UPDATE`).
+3. Si ya existen mensajes con ese `turn_id`: no insertar nada y responder `200`, `stored: 0`.
+4. Insertar los mensajes con `seq = next_seq, next_seq + 1, …` y actualizar `next_seq`.
+
+El `UNIQUE (…, turn_id, role)` es la red de seguridad si dos guardados del mismo turno llegaran a la vez. Limitación: con esa restricción, un turno tiene como máximo un mensaje por rol. Alcanza para `user` + `assistant`; habrá que revisarla si algún día se guardan otros roles.
+
+**Cómo se crea el esquema:** el servicio aplica este SQL al arrancar, y mientras no termine `/health` responde `loading`. No sabe modificar tablas existentes: con el primer cambio de esquema se migra a Alembic. ⚠️ Por esto el rol de base de datos del servicio necesita permiso de DDL.
 
 ## 4. Integración en el orquestador
 
@@ -109,7 +158,7 @@ Mismo formato que el contrato de proveedores (objeto `error` con `message`, `typ
 2. Leer el historial: `GET .../messages?user_id=<el del orquestador>&limit=<MEMORY_HISTORY_LIMIT>`. Si falla → `503 memory_unavailable` (4.4).
 3. Armar `messages` para el proveedor: `[system del orquestador] + historial + mensaje nuevo`.
 4. Reenviar al proveedor (sin cambios respecto de proveedores). Si el proveedor falla, **no se guarda nada**: ni el mensaje del usuario. Se evita dejar un mensaje colgado sin respuesta, y un reintento no lo duplica. ⚠️
-5. Si el proveedor respondió, guardar el turno: `[mensaje del usuario, respuesta del asistente]` en una sola llamada. Si falla → se registra y la respuesta se devuelve igual con `x_memory.status = "write_failed"` (4.4).
+5. Si el proveedor respondió, guardar el turno: `[mensaje del usuario, respuesta del asistente]` en una sola llamada, con un `turn_id` (UUID v4) generado una vez por pedido. Si falla → se registra y la respuesta se devuelve igual con `x_memory.status = "write_failed"` (4.4).
 6. Devolver la respuesta del proveedor más `x_memory` (4.3).
 
 Configuración nueva del orquestador (nombres ⚠️): `MEMORY_URL`, `DEV_USER_ID`, `MEMORY_HISTORY_LIMIT` (valor inicial propuesto: 20 ⚠️), `MEMORY_TIMEOUT_S` (propuesto: 5 ⚠️, **independiente** de `PROVIDER_TIMEOUT_S` para que una memoria colgada no congele el chat).
@@ -142,7 +191,10 @@ Recuerdos duraderos y entre chats · listar y borrar conversaciones · resúmene
 
 ## 6. Pendientes
 
-- ❓ `turn_id` e idempotencia del guardado, al diseñar el esquema de PostgreSQL.
+- ❓ Reintento automático del guardado con el mismo `turn_id`: el esquema ya lo soporta, el orquestador todavía no lo usa.
+- ❓ Mismo `turn_id` con contenido distinto: hoy se ignora en silencio; podría ser un `409`.
+- ❓ Tope de tamaño de `content`, a nivel del servicio.
+- ❓ Concurrencia en lectura: dos pedidos simultáneos a la misma conversación no ven el turno del otro. El guardado sí está serializado.
 - ❓ Presupuesto de tokens: reemplazar el `limit` fijo por un recorte según el modelo (lo hace el orquestador).
 - ❓ Streaming: con `stream: true` el turno se guardaría al terminar el flujo. Qué pasa si el cliente se desconecta a mitad.
 - ❓ `/health` del orquestador: ¿depende de la memoria? Hoy no depende de los proveedores.
@@ -151,4 +203,4 @@ Recuerdos duraderos y entre chats · listar y borrar conversaciones · resúmene
 
 ## 7. Evidencia consultada
 
-Ninguna fuente externa. Todo este documento es **diseño propio** (⚠️). Lo único heredado es el formato de errores y las extensiones `x_`, que vienen del contrato de proveedores y tienen allí su evidencia.
+Ninguna fuente externa. Todo este documento es **diseño propio** (⚠️). Lo único heredado es el formato de errores y las extensiones `x_`, que vienen del contrato de proveedores y tienen allí su evidencia. El comportamiento de PostgreSQL que se da por sentado en 3.6 (`ON CONFLICT`, bloqueo de fila con `FOR UPDATE`, claves foráneas compuestas) es conocimiento general y ⚠️ **no está verificado** contra la documentación: se contrasta al implementar el servicio.
