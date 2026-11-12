@@ -32,6 +32,9 @@ gpu = [
     "torch>=2.15.0",
     "transformers>=5.22.1",
 ]
+memory = [
+    "psycopg[binary,pool]>=3.3.8",
+]
 orchestrator = [
     "httpx2>=2.16.0",
     "pyyaml>=6.0.3",
@@ -45,4 +48,4 @@ server = [
 pythonpath = ["."]
 
 [tool.uv]
-default-groups = ["dev", "server", "client","orchestrator"]
+default-groups = ["dev", "server", "client", "orchestrator", "memory"]
