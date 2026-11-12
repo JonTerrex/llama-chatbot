@@ -12,6 +12,7 @@
 4. **El `user_id` lo pone el orquestador, nunca el cliente.** Hoy sale de configuración; con login saldrá de un token. Un cliente no puede declararse otro usuario.
 5. **Ante un fallo de memoria no hay crash ni respuestas inconexas.** Se informa con un error claro y se registra para poder trabajarlo (sección 4.4).
 6. **Sin `x_conversation_id`, todo funciona como antes:** sin estado, con el historial completo en `messages`, compatible con clientes OpenAI estándar.
+7. **El servicio de memoria no autentica:** confía en el `user_id` que recibe. Por eso solo puede ser alcanzable desde el orquestador: red interna de Docker y, en desarrollo, publicado únicamente en `127.0.0.1`. Nunca en una interfaz pública. ⚠️
 
 ## 2. Servicios y endpoints
 
@@ -93,6 +94,7 @@ Mismo formato que el contrato de proveedores (objeto `error` con `message`, `typ
 
 - `param` nombra el campo que falló o es `null`, igual que en proveedores.
 - Los mensajes de error no incluyen contenido de mensajes ni detalles de la base de datos.
+- Los logs propios del servicio llevan la operación (`read`/`write`), el `conversation_id` y la clase de la excepción. El logger de `psycopg_pool` puede incluir host y puerto de la base cuando no logra conectar, nunca la contraseña. ⚠️ Observado en Windows con el mensaje vacío; por verificar en Linux.
 
 ### 3.6 Esquema de PostgreSQL
 
@@ -200,6 +202,7 @@ Recuerdos duraderos y entre chats · listar y borrar conversaciones · resúmene
 - ❓ `/health` del orquestador: ¿depende de la memoria? Hoy no depende de los proveedores.
 - ❓ Flexibilizar la regla de "exactamente un mensaje `user`" cuando haya clientes que la necesiten.
 - ❓ Retención y borrado de conversaciones.
+- ❓ Autenticación entre servicios (orquestador → memoria), cuando haya login real y niveles de acceso.
 
 ## 7. Evidencia consultada
 

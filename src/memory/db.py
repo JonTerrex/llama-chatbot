@@ -16,6 +16,11 @@ from src.memory.config import Config
 
 SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
+# Espera máxima por una conexión del pool. Corto a propósito: con la base caída, el
+# default (30 s) congelaría cada petición; mejor fallar rápido con 503.
+POOL_TIMEOUT_S = 5.0
+
+
 def crear_pool(config: Config) -> AsyncConnectionPool:
     """
     Sin abrir (open=False): el lifespan decide cuándo abrirlo con `await pool.open()`.
@@ -23,7 +28,11 @@ def crear_pool(config: Config) -> AsyncConnectionPool:
     min_size=1 porque el default de psycopg_pool es 4, que fallaría con DB_POOL_MAX_SIZE < 4.
     """
     return AsyncConnectionPool(
-        config.database_url, min_size=1, max_size=config.pool_max_size, open=False
+        config.database_url,
+        min_size=1,
+        max_size=config.pool_max_size,
+        open=False,
+        timeout=POOL_TIMEOUT_S,
     )
 
 
