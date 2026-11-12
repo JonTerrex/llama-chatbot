@@ -86,7 +86,7 @@ Mismo formato que el contrato de proveedores (objeto `error` con `message`, `typ
 
 | Situación | HTTP | `code` | `type` |
 |---|---|---|---|
-| Petición mal formada (JSON inválido, `conversation_id`, `user_id` o `turn_id` con formato inválido, `limit` fuera de rango, role no permitido) | 400 | `invalid_request` | `invalid_request_error` |
+| Petición mal formada (JSON inválido, `conversation_id`, `user_id` o `turn_id` con formato inválido, `limit` fuera de rango, role no permitido o repetido dentro del turno) | 400 | `invalid_request` | `invalid_request_error` |
 | Ruta o método inexistente | 404 / 405 | `null` | `invalid_request_error` |
 | Base de datos no disponible | 503 | `storage_unavailable` ⚠️ | `memory_error` ⚠️ |
 | Error interno inesperado | 500 | `internal_error` ⚠️ | `memory_error` ⚠️ |
@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS messages (
 3. Si ya existen mensajes con ese `turn_id`: no insertar nada y responder `200`, `stored: 0`.
 4. Insertar los mensajes con `seq = next_seq, next_seq + 1, …` y actualizar `next_seq`.
 
-El `UNIQUE (…, turn_id, role)` es la red de seguridad si dos guardados del mismo turno llegaran a la vez. Limitación: con esa restricción, un turno tiene como máximo un mensaje por rol. Alcanza para `user` + `assistant`; habrá que revisarla si algún día se guardan otros roles.
+Los duplicados se detectan en el paso 3, bajo el bloqueo de la fila. El `UNIQUE (…, turn_id, role)` mantiene la integridad en la base: una violación es un error real y **nunca** se interpreta como duplicado (`stored: 0`). Consecuencia: un turno admite como máximo un mensaje por rol, y el servicio rechaza con `400` uno que repita rol. Alcanza para `user` + `assistant`; habrá que revisarlo si algún día se guardan otros roles.
 
 **Cómo se crea el esquema:** el servicio aplica este SQL al arrancar, y mientras no termine `/health` responde `loading`. No sabe modificar tablas existentes: con el primer cambio de esquema se migra a Alembic. ⚠️ Por esto el rol de base de datos del servicio necesita permiso de DDL.
 
