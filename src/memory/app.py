@@ -157,7 +157,7 @@ async def health(request: Request):
     el estado va en el cuerpo, como en el contrato de proveedores (sección 7).
     """
     try:
-        # Sin tope, con la base caída esperaría POOL_TIMEOUT_S (5 s). Al vencer levanta
+        # Sin tope, con la base caída esperaría POOL_TIMEOUT_S (4 s). Al vencer levanta
         # TimeoutError, que sigue el camino de abajo: warning con la clase y "loading".
         async with asyncio.timeout(HEALTH_TIMEOUT_S):
             await asegurar_esquema(request.app)

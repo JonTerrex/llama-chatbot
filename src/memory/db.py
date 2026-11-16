@@ -18,7 +18,10 @@ SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 # Espera máxima por una conexión del pool. Corto a propósito: con la base caída, el
 # default (30 s) congelaría cada petición; mejor fallar rápido con 503.
-POOL_TIMEOUT_S = 5.0
+# Debe ser MENOR que MEMORY_TIMEOUT_S del orquestador (5 s, contrato 4.2): así memory
+# contesta su 503 en vez de que el orquestador corte la conexión a mitad. Si se cambia
+# uno, revisar el otro.
+POOL_TIMEOUT_S = 4.0
 
 
 def crear_pool(config: Config) -> AsyncConnectionPool:
