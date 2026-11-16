@@ -37,6 +37,9 @@ HISTORY_LIMIT_MAX = 200
 # para que los tests lo bajen.
 POOL_CLOSE_TIMEOUT_S = 5.0
 
+# Tope de /health: menor que el timeout del healthcheck de compose (3 s), para que llegue a leer "loading".
+HEALTH_TIMEOUT_S = 2.0
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -154,9 +157,12 @@ async def health(request: Request):
     el estado va en el cuerpo, como en el contrato de proveedores (sección 7).
     """
     try:
-        await asegurar_esquema(request.app)
-        async with request.app.state.pool.connection() as conn:
-            await conn.execute("SELECT 1")
+        # Sin tope, con la base caída esperaría POOL_TIMEOUT_S (5 s). Al vencer levanta
+        # TimeoutError, que sigue el camino de abajo: warning con la clase y "loading".
+        async with asyncio.timeout(HEALTH_TIMEOUT_S):
+            await asegurar_esquema(request.app)
+            async with request.app.state.pool.connection() as conn:
+                await conn.execute("SELECT 1")
     except Exception as e:
         logger.warning("Health: base no lista (%s).", type(e).__name__)
         return {"status": "loading"}

@@ -7,6 +7,8 @@ caída (DATABASE_URL a un puerto cerrado), que cubre errores y validación sin D
 import asyncio
 import logging
 import os
+import time
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import psycopg
@@ -158,6 +160,41 @@ def test_health_loading_con_base_caida(base_caida):
         r = c.get("/health")
     assert r.status_code == 200
     assert r.json() == {"status": "loading"}
+
+
+class PoolLento:
+    """Pool falso cuya connection() tarda más que el tope de /health: simula una base colgada."""
+
+    async def open(self, wait=False):
+        pass
+
+    async def close(self, timeout=None):
+        pass
+
+    @asynccontextmanager
+    async def connection(self):
+        await asyncio.sleep(5)
+        yield None
+
+
+def test_health_respeta_su_timeout_aunque_la_base_no_responda(base_caida, monkeypatch, caplog):
+    async def esquema_ok(pool):
+        return None
+
+    # El esquema "ya está" para que el lifespan no toque el pool; la demora queda en el SELECT 1.
+    monkeypatch.setattr(mem_app, "crear_pool", lambda config: PoolLento())
+    monkeypatch.setattr(mem_app, "aplicar_esquema", esquema_ok)
+    monkeypatch.setattr(mem_app, "HEALTH_TIMEOUT_S", 0.1)
+    with caplog.at_level(logging.WARNING):
+        with cliente() as c:
+            inicio = time.perf_counter()
+            r = c.get("/health")
+            duracion = time.perf_counter() - inicio
+
+    assert r.status_code == 200
+    assert r.json() == {"status": "loading"}
+    assert duracion < 0.5
+    assert any("TimeoutError" in rec.getMessage() for rec in caplog.records if rec.name == "memory")
 
 
 def test_logs_sin_contenido_ni_datos_de_conexion_cuando_falla_el_guardado(base_caida, caplog):
