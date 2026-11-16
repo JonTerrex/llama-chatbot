@@ -95,7 +95,7 @@ Mismo formato que el contrato de proveedores (objeto `error` con `message`, `typ
 - `param` nombra el campo que falló o es `null`, igual que en proveedores.
 - Los mensajes de error no incluyen contenido de mensajes ni detalles de la base de datos.
 - Los logs propios del servicio llevan la operación (`read`/`write`), el `conversation_id` y la clase de la excepción. El logger de `psycopg_pool` incluye el **host** de la base cuando no logra conectar (observado en Linux, dentro del contenedor: `failed to resolve host 'postgres'`); en ese fallo de DNS no aparecieron ni el puerto ni la contraseña. ⚠️ Con la base viva pero rechazando conexiones el mensaje de libpq podría traer IP y puerto: no se probó. Los logs son internos y el cuerpo del 503 nunca los incluye.
-- **Timeouts** ⚠️: con la base caída, cada petición espera `POOL_TIMEOUT_S` antes de dar el 503 (`PoolTimeout`); se midió 5,00 s con 5.0, y con el valor actual de 4.0 se espera 4 s (sin medir). `/health` responde `loading` en `HEALTH_TIMEOUT_S` = 2 s como máximo. Invariante: `MEMORY_TIMEOUT_S` del orquestador (5 s) debe ser **mayor** que `POOL_TIMEOUT_S` (4 s); hoy hay 1 s de margen.
+- **Timeouts** ⚠️: con la base caída, cada petición espera `POOL_TIMEOUT_S` antes de dar el 503 (`PoolTimeout`); se midió 5,00 s con 5.0 y 4,02 s con el valor actual de 4.0 (Docker, 2026-11-16; las primeras peticiones tras parar la base fallan al instante porque el pool aún tiene conexiones viejas). `/health` responde `loading` en `HEALTH_TIMEOUT_S` = 2 s como máximo (medido: 2,00 y 2,01 s). Invariante: `MEMORY_TIMEOUT_S` del orquestador (5 s) debe ser **mayor** que `POOL_TIMEOUT_S` (4 s); hoy hay 1 s de margen.
 
 ### 3.6 Esquema de PostgreSQL
 
@@ -166,6 +166,8 @@ Los duplicados se detectan en el paso 3, bajo el bloqueo de la fila. El `UNIQUE 
 
 Configuración nueva del orquestador (nombres ⚠️): `MEMORY_URL`, `DEV_USER_ID`, `MEMORY_HISTORY_LIMIT` (valor inicial propuesto: 20 ⚠️), `MEMORY_TIMEOUT_S` (propuesto: 5 ⚠️, **independiente** de `PROVIDER_TIMEOUT_S` para que una memoria colgada no congele el chat). Debe ser mayor que `POOL_TIMEOUT_S` de la memoria (4 s, sección 3.5), para que con la base caída la memoria alcance a responder su 503.
 
+`MEMORY_URL` es **opcional**: ausente o vacía significa **memoria deshabilitada**, y sin `x_conversation_id` el orquestador se comporta como hoy. `DEV_USER_ID` solo se exige si `MEMORY_URL` está definida.
+
 ### 4.3 Respuesta
 
 Se agrega a la respuesta del proveedor un objeto opcional `x_memory`, **solo si el cliente mandó `x_conversation_id`**:
@@ -182,9 +184,11 @@ Valores de `status` en una respuesta exitosa: `saved` o `write_failed`. Quitar e
 |---|---|---|
 | **Al leer** (antes de generar) | `503`, `code: "memory_unavailable"`, `type: "memory_error"` ⚠️, con un mensaje claro | No llama al proveedor. No se genera ni se guarda nada. |
 | **Al guardar** (después de generar) | La respuesta normal, con `x_memory.status = "write_failed"` | Registra el error y no falla el pedido |
+| **Memoria deshabilitada** (`MEMORY_URL` vacía) y el cliente manda `x_conversation_id` | `503`, `code: "memory_unavailable"`, `type: "memory_error"` ⚠️, con un mensaje claro | No llama a la memoria ni al proveedor. Es una condición de configuración del servidor, no un error del cliente. |
 
 - Se considera fallo cualquier cosa que impida usar la memoria: no conecta, timeout, respuesta no JSON, estado no 2xx. Un timeout se informa como `memory_unavailable`, igual que una conexión caída ⚠️.
 - **Por qué `503` al leer y no degradar:** responder sin historial produce una respuesta que parece normal y está desconectada de la conversación; además ese turno quedaría guardado en un hilo con un hueco.
+- **Memoria deshabilitada:** se evalúa en el paso 1, **después** de validar la petición: un `400` por formato (`x_conversation_id` inválido, o `messages` que no es exactamente un mensaje `user`) tiene prioridad sobre este `503`. ⚠️ No se ignora el campo en silencio por la misma razón que al fallar la lectura: la respuesta parecería normal y estaría desconectada de la conversación. Tampoco es un `400`: el cliente no hizo nada mal.
 - **Log:** `conversation_id`, operación (`read` o `write`) y clase de la excepción. **Nunca** el contenido de los mensajes ni la URL interna.
 - El mensaje de error al cliente no incluye el host de la memoria (misma regla que con los proveedores).
 
