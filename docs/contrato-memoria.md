@@ -94,7 +94,8 @@ Mismo formato que el contrato de proveedores (objeto `error` con `message`, `typ
 
 - `param` nombra el campo que falló o es `null`, igual que en proveedores.
 - Los mensajes de error no incluyen contenido de mensajes ni detalles de la base de datos.
-- Los logs propios del servicio llevan la operación (`read`/`write`), el `conversation_id` y la clase de la excepción. El logger de `psycopg_pool` puede incluir host y puerto de la base cuando no logra conectar, nunca la contraseña. ⚠️ Observado en Windows con el mensaje vacío; por verificar en Linux.
+- Los logs propios del servicio llevan la operación (`read`/`write`), el `conversation_id` y la clase de la excepción. El logger de `psycopg_pool` incluye el **host** de la base cuando no logra conectar (observado en Linux, dentro del contenedor: `failed to resolve host 'postgres'`); en ese fallo de DNS no aparecieron ni el puerto ni la contraseña. ⚠️ Con la base viva pero rechazando conexiones el mensaje de libpq podría traer IP y puerto: no se probó. Los logs son internos y el cuerpo del 503 nunca los incluye.
+- **Timeouts** ⚠️: con la base caída, cada petición espera `POOL_TIMEOUT_S` antes de dar el 503 (`PoolTimeout`); se midió 5,00 s con 5.0, y con el valor actual de 4.0 se espera 4 s (sin medir). `/health` responde `loading` en `HEALTH_TIMEOUT_S` = 2 s como máximo. Invariante: `MEMORY_TIMEOUT_S` del orquestador (5 s) debe ser **mayor** que `POOL_TIMEOUT_S` (4 s); hoy hay 1 s de margen.
 
 ### 3.6 Esquema de PostgreSQL
 
@@ -163,7 +164,7 @@ Los duplicados se detectan en el paso 3, bajo el bloqueo de la fila. El `UNIQUE 
 5. Si el proveedor respondió, guardar el turno: `[mensaje del usuario, respuesta del asistente]` en una sola llamada, con un `turn_id` (UUID v4) generado una vez por pedido. Si falla → se registra y la respuesta se devuelve igual con `x_memory.status = "write_failed"` (4.4).
 6. Devolver la respuesta del proveedor más `x_memory` (4.3).
 
-Configuración nueva del orquestador (nombres ⚠️): `MEMORY_URL`, `DEV_USER_ID`, `MEMORY_HISTORY_LIMIT` (valor inicial propuesto: 20 ⚠️), `MEMORY_TIMEOUT_S` (propuesto: 5 ⚠️, **independiente** de `PROVIDER_TIMEOUT_S` para que una memoria colgada no congele el chat).
+Configuración nueva del orquestador (nombres ⚠️): `MEMORY_URL`, `DEV_USER_ID`, `MEMORY_HISTORY_LIMIT` (valor inicial propuesto: 20 ⚠️), `MEMORY_TIMEOUT_S` (propuesto: 5 ⚠️, **independiente** de `PROVIDER_TIMEOUT_S` para que una memoria colgada no congele el chat). Debe ser mayor que `POOL_TIMEOUT_S` de la memoria (4 s, sección 3.5), para que con la base caída la memoria alcance a responder su 503.
 
 ### 4.3 Respuesta
 
@@ -202,8 +203,9 @@ Recuerdos duraderos y entre chats · listar y borrar conversaciones · resúmene
 - ❓ `/health` del orquestador: ¿depende de la memoria? Hoy no depende de los proveedores.
 - ❓ Flexibilizar la regla de "exactamente un mensaje `user`" cuando haya clientes que la necesiten.
 - ❓ Retención y borrado de conversaciones.
+- ⚠️ Recuperación del pool tras una caída de la base (medido en Docker, con `reconnect_timeout` por defecto de `psycopg_pool`, 300 s): una caída de 20 s se recupera en el primer intento; una de ~4,5 min tardó ~70 s en volver tras reiniciar Postgres, sin reiniciar `memory`. Explicación probable, ❓ sin confirmar: backoff creciente entre reintentos. No se probó una caída más larga ni se ajustó el pool.
 - ❓ Autenticación entre servicios (orquestador → memoria), cuando haya login real y niveles de acceso.
 
 ## 7. Evidencia consultada
 
-Ninguna fuente externa. Todo este documento es **diseño propio** (⚠️). Lo único heredado es el formato de errores y las extensiones `x_`, que vienen del contrato de proveedores y tienen allí su evidencia. El comportamiento de PostgreSQL que se da por sentado en 3.6 (`ON CONFLICT`, bloqueo de fila con `FOR UPDATE`, claves foráneas compuestas) es conocimiento general y ⚠️ **no está verificado** contra la documentación: se contrasta al implementar el servicio.
+Ninguna fuente externa. Todo este documento es **diseño propio** (⚠️). Lo único heredado es el formato de errores y las extensiones `x_`, que vienen del contrato de proveedores y tienen allí su evidencia. El comportamiento de PostgreSQL que se da por sentado en 3.6 (`ON CONFLICT`, bloqueo de fila con `FOR UPDATE`, claves foráneas compuestas) es conocimiento general y ⚠️ **no está verificado** contra la documentación: se contrasta al implementar el servicio. Contrastado hasta ahora de forma empírica, no contra la documentación: los 47 tests de memoria pasan contra PostgreSQL 18 real (incluidos los de concurrencia) y el servicio se verificó en Docker (idempotencia, persistencia del volumen, 503 sin detalles, recuperación).
