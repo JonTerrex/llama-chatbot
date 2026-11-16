@@ -1,0 +1,37 @@
+# ==========================================
+# STAGE 1: Builder
+# ==========================================
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_PYTHON_PREFERENCE=only-system
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+# "server" (fastapi + uvicorn) + "memory" (psycopg binario + pool): sin torch ni streamlit
+RUN uv sync --frozen --no-default-groups --group server --group memory --no-install-project
+
+# ==========================================
+# STAGE 2: Runner
+# ==========================================
+FROM python:3.12-slim
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+
+# Solo src/memory (incluye schema.sql, que db.py lee al aplicar el esquema).
+# src/__init__.py se omite a propósito: importa src.chatbot, y sin él "src"
+# funciona como paquete de espacio de nombres implícito.
+COPY src/memory/ /app/src/memory/
+
+# DATABASE_URL NO se hornea: lleva la contraseña y llega por entorno (compose / .env).
+# Si falta, el servicio no arranca (cargar_config levanta ValueError), que es lo deseado.
+ENV PATH="/app/.venv/bin:$PATH"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.memory.app:app", "--host", "0.0.0.0", "--port", "8000"]

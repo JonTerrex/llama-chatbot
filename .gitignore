@@ -2,6 +2,7 @@
 .venv/
 env/
 venv/
+.env
 
 # Pesos del modelo y datos pesados
 modelos/

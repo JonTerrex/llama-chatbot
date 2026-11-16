@@ -62,3 +62,49 @@ services:
       - DEFAULT_MODEL=mock
       # Segundos máximos esperando la respuesta del proveedor
       - PROVIDER_TIMEOUT_S=120
+
+  # PostgreSQL de la memoria (desarrollo). Sin ports: solo accesible por la red interna de compose.
+  postgres:
+    image: postgres:18
+    profiles: ["dev"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?define POSTGRES_USER en .env}
+      POSTGRES_DB: ${POSTGRES_DB:?define POSTGRES_DB en .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+    volumes:
+      # Desde la imagen 18 el VOLUME es /var/lib/postgresql (PGDATA=/var/lib/postgresql/18/docker).
+      - memory-db:/var/lib/postgresql
+    healthcheck:
+      # $$ para que compose no interpole: las variables las expande el shell del contenedor.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Servicio de memoria: historial de conversaciones sobre PostgreSQL.
+  memory:
+    build:
+      context: .
+      dockerfile: Dockerfile.memory
+    profiles: ["dev"]
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Solo loopback: el servicio NO autentica y confía en el user_id que recibe
+      # (contrato de memoria, principio 7). Publicado en 0.0.0.0, cualquiera en la red
+      # podría leer o escribir conversaciones ajenas. El orquestador lo alcanza por
+      # la red interna (http://memory:8000), no por este puerto.
+      - "127.0.0.1:8003:8000"
+    healthcheck:
+      # La imagen slim no trae curl. Sano SOLO si el cuerpo dice "ready": /health
+      # responde 200 también en "loading", así que el status HTTP no alcanza.
+      test: ["CMD", "python", "-c", "import json, sys, urllib.request; sys.exit(0 if json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)).get('status') == 'ready' else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+volumes:
+    memory-db:
