@@ -17,6 +17,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+# USER_ID_PATTERN es el patrón de ids de memoria (contrato de memoria, 3.1); vale igual para
+# conversation_id. Se importa en vez de duplicarlo para que no puedan divergir.
+from src.orchestrator.config import USER_ID_PATTERN as MEMORY_ID_PATTERN
 from src.orchestrator.config import Config, cargar_config
 
 logger = logging.getLogger("orchestrator")
@@ -24,6 +27,7 @@ logger = logging.getLogger("orchestrator")
 # ⚠️ Convención propia, no verificada contra OpenAI: centralizadas aquí para cambiarlas fácil.
 ERROR_TYPE_INVALID_REQUEST = "invalid_request_error"
 ERROR_TYPE_PROVIDER = "provider_error"
+ERROR_TYPE_MEMORY = "memory_error"
 STREAMING_NOT_SUPPORTED_STATUS = 501
 
 CONNECT_TIMEOUT_S = 5.0
@@ -74,6 +78,9 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    # Campo propio (contrato de memoria, 4.1). Declarado para que no caiga en model_extra:
+    # no se loguea como extra y nunca se reenvía al proveedor.
+    x_conversation_id: Optional[str] = None
 
 
 # ---------- Errores (contrato, sección 6) ----------
@@ -177,6 +184,35 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "El streaming todavía no está implementado en el orquestador.",
             ERROR_TYPE_PROVIDER, "streaming_not_supported", "stream",
         )
+
+    # 2b. Memoria (contrato de memoria, 4.1 y 4.4). Orden: los 400 de formato van antes que
+    #     el 503 por memoria deshabilitada, y todo esto después de modelo y stream.
+    if req.x_conversation_id is not None:
+        # fullmatch sin anclas: con "^...$" y match, "$" aceptaría un "\n" final.
+        if not MEMORY_ID_PATTERN.fullmatch(req.x_conversation_id):
+            return error_response(
+                400, "x_conversation_id debe tener 1 a 64 caracteres entre letras, dígitos, '_' y '-'.",
+                ERROR_TYPE_INVALID_REQUEST, "invalid_request", "x_conversation_id",
+            )
+        # Con memoria, el historial lo pone el servicio: el cliente manda solo el turno nuevo.
+        # Estricto a propósito (contrato 4.1): no se descartan ni se reenvían mensajes extra.
+        if len(req.messages) != 1 or req.messages[0].role != "user":
+            return error_response(
+                400, "Con x_conversation_id, 'messages' debe tener exactamente un mensaje, con role 'user'.",
+                ERROR_TYPE_INVALID_REQUEST, "invalid_request", "messages",
+            )
+        if config.memory_url is None:
+            # Condición de configuración del servidor, no error del cliente: 503, no 400.
+            # Ignorar el campo daría una respuesta normal desconectada de la conversación.
+            logger.warning(
+                "x_conversation_id recibido con la memoria deshabilitada (conversation_id=%r).",
+                req.x_conversation_id,
+            )
+            return error_response(
+                503, "La memoria de conversaciones no está habilitada en este servidor.",
+                ERROR_TYPE_MEMORY, "memory_unavailable",
+            )
+        # TODO bloque 3b
 
     # 3. Los extras se descartan en silencio para el cliente, pero quedan en el log para diagnosticar.
     if req.model_extra:
