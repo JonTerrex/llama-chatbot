@@ -1,0 +1,43 @@
+# ==========================================
+# STAGE 1: Builder
+# ==========================================
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_PYTHON_PREFERENCE=only-system
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+# "server" (fastapi + uvicorn) + "gpu" (torch, transformers, bitsandbytes, accelerate).
+# torch sale de PyPI tal como está en uv.lock: en Linux x86_64 la rueda trae CUDA (paquetes nvidia-*-cu13).
+RUN uv sync --frozen --no-default-groups --group server --group gpu --no-install-project
+
+# ==========================================
+# STAGE 2: Runner
+# ==========================================
+FROM python:3.12-slim
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+
+# Solo el proveedor (es autocontenido). src/__init__.py se omite a propósito: importa
+# src.chatbot, y sin él "src" funciona como paquete de espacio de nombres implícito.
+COPY src/providers/__init__.py /app/src/providers/__init__.py
+COPY src/providers/llama_local/ /app/src/providers/llama_local/
+
+# El modelo NO va en la imagen: se monta en /app/modelos (pesa varios GB y cambia aparte).
+ENV PATH="/app/.venv/bin:$PATH"
+ENV MODEL_PATH="/app/modelos/llama3"
+ENV TOP_P="0.9"
+# ⚠️ LOG_LEVEL=DEBUG imprime tracebacks que pueden incluir texto del usuario.
+ENV LOG_LEVEL="INFO"
+ENV PYTHONUNBUFFERED="1"
+
+EXPOSE 8000
+
+# Un solo worker: hay una sola GPU y cada worker cargaría su propia copia del modelo.
+CMD ["uvicorn", "src.providers.llama_local.app:app", "--host", "0.0.0.0", "--port", "8000"]

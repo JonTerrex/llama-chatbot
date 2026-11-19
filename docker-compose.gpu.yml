@@ -16,3 +16,34 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  # Proveedor Llama 3 8B en GPU (4 bits). Sin profile, igual que el resto de este archivo.
+  llama-local:
+    build:
+      context: .
+      dockerfile: Dockerfile.llama
+    volumes:
+      # El modelo se monta, no va en la imagen.
+      - ./modelos:/app/modelos:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # "no": si la carga falla (sin GPU, poca VRAM) el proveedor queda vivo en estado
+    # "failed", con el motivo en el log, en vez de reiniciarse en bucle.
+    restart: "no"
+    ports:
+      # Solo loopback: el proveedor no autentica. NUNCA publicarlo sin el 127.0.0.1;
+      # en cloud no se publica, el orquestador lo alcanza por la red interna (http://llama-local:8000).
+      - "127.0.0.1:8004:8000"
+    healthcheck:
+      # La imagen slim no trae curl. Sano solo con HTTP 200 ("ready"): loading y failed dan 503.
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # La carga en frío tarda ~2:10-2:40: los fallos durante este período no cuentan.
+      start_period: 300s

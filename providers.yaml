@@ -1,3 +1,5 @@
 providers:
   mock:
     url: http://mock:8000
+  llama3-8b-local:
+    url: http://llama-local:8000
