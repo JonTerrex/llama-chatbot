@@ -17,8 +17,10 @@ services:
               count: 1
               capabilities: [gpu]
 
-  # Proveedor Llama 3 8B en GPU (4 bits). Sin profile, igual que el resto de este archivo.
+  # Proveedor Llama 3 8B en GPU (4 bits). Con profile propio "llama" (ver abajo).
   llama-local:
+    # Temporal: evita levantar api y llama-local a la vez en una GPU de 8 GB. Se revisa al retirar api.
+    profiles: ["llama"]
     build:
       context: .
       dockerfile: Dockerfile.llama
@@ -45,5 +47,6 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
-      # La carga en frío tarda ~2:10-2:40: los fallos durante este período no cuentan.
-      start_period: 300s
+      # Carga en frío medida: ~194 s sobre bind mount de Windows. 420 s deja margen para discos
+      # más lentos; los fallos durante este período no cuentan.
+      start_period: 420s
