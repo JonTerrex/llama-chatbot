@@ -152,6 +152,7 @@ Los duplicados se detectan en el paso 3, bajo el bloqueo de la fila. El `UNIQUE 
 
 - **Con `x_conversation_id`:** `messages` debe contener **exactamente un mensaje, con rol `user`**: el turno nuevo. Cualquier otra cosa → `400 invalid_request` con `param: "messages"`. ⚠️ Es estricto a propósito para el MVP (❓ sección 6).
 - **Sin `x_conversation_id`:** comportamiento actual, sin memoria.
+- `"x_conversation_id": null` explícito equivale a no mandarlo: sin memoria y sin `x_memory`. Una cadena vacía, en cambio, es un formato inválido → `400`.
 - Un cliente que mande `x_user_id` (o cualquier otro campo que no sea de la lista) lo tiene descartado como cualquier extra, con warning en el log. El `user_id` nunca se toma del cuerpo.
 - El `x_conversation_id` **no se reenvía** al proveedor.
 
@@ -170,13 +171,18 @@ Configuración nueva del orquestador (nombres ⚠️): `MEMORY_URL`, `DEV_USER_I
 
 ### 4.3 Respuesta
 
-Se agrega a la respuesta del proveedor un objeto opcional `x_memory`, **solo si el cliente mandó `x_conversation_id`**:
+Se agrega a la respuesta del proveedor un objeto opcional `x_memory`, **solo si el cliente mandó `x_conversation_id`** (con una única excepción: si el JSON del proveedor no es un objeto, ver abajo):
 
 ```json
 {"x_memory": {"status": "saved"}}
 ```
 
 Valores de `status` en una respuesta exitosa: `saved` o `write_failed`. Quitar el campo no cambia nada de lo estándar (principio 2 del contrato de proveedores).
+
+- `x_memory` contiene solo `status`: el `turn_id` y la causa interna de un fallo no se exponen; van al log.
+- **El proveedor responde 2xx sin `choices[0].message.content` de texto** (falta, o no es una cadena): la respuesta se devuelve tal cual con `x_memory.status = "write_failed"`, **sin intentar guardar**, y se registra a nivel ERROR. El proveedor rompió su contrato; no es un fallo de la memoria. ⚠️
+- **`content` igual a `""`** sí se guarda: el servicio de memoria lo acepta (`Message.content` no tiene largo mínimo).
+- **El proveedor responde 2xx pero el JSON no es un objeto** (p. ej. una lista): se devuelve tal cual, **sin `x_memory`** (no hay dónde agregarlo), sin guardar y con log ERROR. Es la excepción a la regla de que `x_memory` va siempre que el cliente mandó `x_conversation_id`. ⚠️
 
 ### 4.4 Fallos de memoria
 
@@ -189,7 +195,7 @@ Valores de `status` en una respuesta exitosa: `saved` o `write_failed`. Quitar e
 - Se considera fallo cualquier cosa que impida usar la memoria: no conecta, timeout, respuesta no JSON, estado no 2xx. Un timeout se informa como `memory_unavailable`, igual que una conexión caída ⚠️.
 - **Por qué `503` al leer y no degradar:** responder sin historial produce una respuesta que parece normal y está desconectada de la conversación; además ese turno quedaría guardado en un hilo con un hueco.
 - **Memoria deshabilitada:** se evalúa en el paso 1, **después** de validar la petición: un `400` por formato (`x_conversation_id` inválido, o `messages` que no es exactamente un mensaje `user`) tiene prioridad sobre este `503`. ⚠️ No se ignora el campo en silencio por la misma razón que al fallar la lectura: la respuesta parecería normal y estaría desconectada de la conversación. Tampoco es un `400`: el cliente no hizo nada mal.
-- **Log:** `conversation_id`, operación (`read` o `write`) y clase de la excepción. **Nunca** el contenido de los mensajes ni la URL interna.
+- **Log:** `MemoryClient` registra `op` (`read`/`write`), `conversation_id`, `causa` (cerrada: `conexion`, `timeout`, `estado_http`, `respuesta_invalida`) y `origen`: la clase de la excepción cuando el pedido no llegó a completarse (incluye el tope total de tiempo y los errores de decodificación), o `HTTP <código>`, `json` o `forma` cuando hubo respuesta pero no sirvió. Nivel WARNING, salvo `respuesta_invalida`, que va en ERROR. Además, el orquestador registra: WARNING con `conversation_id` y `turn_id` si falla el guardado; WARNING con `conversation_id` si llega `x_conversation_id` con la memoria deshabilitada; ERROR con `conversation_id` si el proveedor responde sin `content` de texto o con un JSON que no es objeto. La `causa` solo está en los logs: al leer, el cliente recibe siempre `memory_unavailable`; al guardar, `write_failed`, sea cual sea la causa. **Nunca** el contenido de los mensajes ni la URL interna.
 - El mensaje de error al cliente no incluye el host de la memoria (misma regla que con los proveedores).
 
 ## 5. Fuera de alcance de esta fase
@@ -201,7 +207,8 @@ Recuerdos duraderos y entre chats · listar y borrar conversaciones · resúmene
 - ❓ Reintento automático del guardado con el mismo `turn_id`: el esquema ya lo soporta, el orquestador todavía no lo usa.
 - ❓ Mismo `turn_id` con contenido distinto: hoy se ignora en silencio; podría ser un `409`.
 - ❓ Tope de tamaño de `content`, a nivel del servicio.
-- ❓ Concurrencia en lectura: dos pedidos simultáneos a la misma conversación no ven el turno del otro. El guardado sí está serializado.
+- ❓ Concurrencia en lectura: dos pedidos simultáneos a la misma conversación no ven el turno del otro: cada uno lee el historial antes de que el otro guarde. El guardado sí está serializado (3.6, `next_seq`), así que el orden por `seq` se mantiene, pero la segunda respuesta no ve el turno de la primera. No se probó ni se mitiga.
+- ❓ Reintento del cliente tras perder la respuesta: guarda el turno dos veces (ver 3.2, último punto). Una salida posible, no decidida: que el cliente provea una clave de idempotencia.
 - ❓ Presupuesto de tokens: reemplazar el `limit` fijo por un recorte según el modelo (lo hace el orquestador).
 - ❓ Streaming: con `stream: true` el turno se guardaría al terminar el flujo. Qué pasa si el cliente se desconecta a mitad.
 - ❓ `/health` del orquestador: ¿depende de la memoria? Hoy no depende de los proveedores.
@@ -213,3 +220,5 @@ Recuerdos duraderos y entre chats · listar y borrar conversaciones · resúmene
 ## 7. Evidencia consultada
 
 Ninguna fuente externa. Todo este documento es **diseño propio** (⚠️). Lo único heredado es el formato de errores y las extensiones `x_`, que vienen del contrato de proveedores y tienen allí su evidencia. El comportamiento de PostgreSQL que se da por sentado en 3.6 (`ON CONFLICT`, bloqueo de fila con `FOR UPDATE`, claves foráneas compuestas) es conocimiento general y ⚠️ **no está verificado** contra la documentación: se contrasta al implementar el servicio. Contrastado hasta ahora de forma empírica, no contra la documentación: los 47 tests de memoria pasan contra PostgreSQL 18 real (incluidos los de concurrencia) y el servicio se verificó en Docker (idempotencia, persistencia del volumen, 503 sin detalles, recuperación).
+
+Flujo del orquestador (4.1 a 4.4): probado solo con `TestClient` y `httpx2.MockTransport`, sin red ni servicios reales, y con cinco mutaciones del flujo aplicadas en una copia temporal fuera del repo (guardar antes de llamar al proveedor, seguir sin historial si la lectura falla, devolver `saved` ante un guardado fallido, no proyectar el historial, reenviar `x_conversation_id`): los tests fallaron en cada una. Esa copia usó Python 3.10 con un reemplazo de `asyncio.timeout`, así que el caso `timeout` de la lectura no se pudo evaluar allí; la suite completa pasa (186 passed, 22 skipped por falta de `TEST_DATABASE_URL`) en Python 3.14. ⚠️ **No verificado todavía:** el flujo de punta a punta contra el orquestador y la memoria reales en Docker, ni que un segundo pedido vea lo que guardó el primero.
