@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import src.orchestrator.app as orq
 from src.orchestrator.app import app
+from src.orchestrator.logging_config import LOGGERS_SILENCIADOS, configurar_logging
 from tests.test_memory_client import MemoriaFalsa
 
 URL = "/v1/chat/completions"
@@ -28,6 +29,21 @@ RESPUESTA_PROVEEDOR = {
     "x_metrics": {"latency_s": 0.123, "tokens_per_s": 8.13},
     "x_debug": {"messages": [], "params": {}},
 }
+
+
+@pytest.fixture(autouse=True)
+def niveles_de_loggers_http():
+    """
+    El lifespan fija httpx2/httpcore2 en WARNING para todo el proceso. Cada test arranca
+    como un proceso nuevo (sin nivel propio, NOTSET) y al final se restaura el original,
+    para no afectar a otros tests ni hacer pasar un test por un nivel que dejó otro.
+    """
+    originales = {n: logging.getLogger(n).level for n in LOGGERS_SILENCIADOS}
+    for nombre in LOGGERS_SILENCIADOS:
+        logging.getLogger(nombre).setLevel(logging.NOTSET)
+    yield
+    for nombre, nivel in originales.items():
+        logging.getLogger(nombre).setLevel(nivel)
 
 
 class ProveedorFalso:
@@ -677,3 +693,47 @@ def test_sin_memory_url_no_se_crea_cliente_de_memoria(proveedor, memoria):
     with TestClient(app) as client:
         assert client.app.state.memory_client is None
     assert memoria.clientes == []
+
+
+# ---------- Logging: httpx2 no escribe URLs (bloque 3c) ----------
+
+def test_configurar_logging_fija_warning_y_es_idempotente():
+    configurar_logging()
+    assert all(logging.getLogger(n).level == logging.WARNING for n in LOGGERS_SILENCIADOS)
+    configurar_logging()
+    assert all(logging.getLogger(n).level == logging.WARNING for n in LOGGERS_SILENCIADOS)
+
+
+def _memoria_get_503(request):
+    return httpx2.Response(503, json={"error": {"message": "x"}})
+
+
+def _memoria_post_503(request):
+    if request.method == "GET":
+        return responder_memoria_por_defecto(request)
+    return httpx2.Response(503, json={"error": {"message": "x"}})
+
+
+@pytest.mark.parametrize(
+    "responder, status, x_memory",
+    [
+        (responder_memoria_por_defecto, 200, {"status": "saved"}),
+        (_memoria_get_503, 503, None),
+        (_memoria_post_503, 200, {"status": "write_failed"}),
+    ],
+    ids=["camino_feliz", "lectura_falla", "guardado_falla"],
+)
+def test_ningun_log_contiene_urls_internas_con_root_en_info(memoria_habilitada, memoria, caplog, responder, status, x_memory):
+    # Root en INFO: es justo el caso que esta protección cubre. No se filtra por logger:
+    # ningún registro, de ninguna librería, puede traer el host de la memoria ni del proveedor.
+    memoria.responder = responder
+    with caplog.at_level(logging.INFO):
+        with TestClient(app) as client:
+            r = pedir(client, x_conversation_id=CONV)
+
+    assert r.status_code == status
+    assert r.json().get("x_memory") == x_memory
+    for rec in caplog.records:
+        texto = f"{rec.name} {rec.getMessage()} {rec.args!r}"
+        for secreto in (HOST_MEMORIA, f"http://{HOST_MEMORIA}:8000", HOST_PROVEEDOR, f"http://{HOST_PROVEEDOR}:9000"):
+            assert secreto not in texto, f"{rec.name} filtró una URL interna"

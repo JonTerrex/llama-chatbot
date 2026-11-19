@@ -22,6 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 # conversation_id. Se importa en vez de duplicarlo para que no puedan divergir.
 from src.orchestrator.config import USER_ID_PATTERN as MEMORY_ID_PATTERN
 from src.orchestrator.config import Config, cargar_config
+from src.orchestrator.logging_config import configurar_logging
 from src.orchestrator.memory_client import MemoryClient, MemoryUnavailable, crear_cliente_memoria
 
 logger = logging.getLogger("orchestrator")
@@ -48,6 +49,8 @@ def crear_cliente(config: Config) -> httpx2.AsyncClient:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Carga la configuración al arrancar (si es inválida, el servicio no arranca) y abre un cliente HTTP compartido."""
+    # Primero: antes de crear cualquier cliente HTTP, que httpx2 no pueda loguear URLs.
+    configurar_logging()
     app.state.config = cargar_config()
     # Un solo cliente para todo el proceso: reutiliza conexiones con los proveedores.
     app.state.client = crear_cliente(app.state.config)
