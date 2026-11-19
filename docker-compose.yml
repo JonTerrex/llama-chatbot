@@ -42,7 +42,9 @@ services:
       dockerfile: Dockerfile.mock
     profiles: ["dev"]
     ports:
-      - "8001:8000"
+      # Solo loopback: /debug/requests expone los últimos cuerpos recibidos, que con la
+      # memoria activa incluyen el historial de la conversación.
+      - "127.0.0.1:8001:8000"
     environment:
       - MOCK_LATENCY=0
       - MOCK_HISTORY_SIZE=20
@@ -53,7 +55,10 @@ services:
       dockerfile: Dockerfile.orchestrator
     profiles: ["dev"]
     ports:
-      - "8002:8000"
+      # Solo loopback: con la memoria activa, quien alcance este puerto puede leer las
+      # conversaciones del usuario de desarrollo (la memoria no autentica y el
+      # orquestador fija el user_id).
+      - "127.0.0.1:8002:8000"
     volumes:
       # Registro de proveedores montado, no horneado en la imagen
       - ./providers.yaml:/app/providers.yaml:ro
@@ -62,6 +67,19 @@ services:
       - DEFAULT_MODEL=mock
       # Segundos máximos esperando la respuesta del proveedor
       - PROVIDER_TIMEOUT_S=120
+      # Memoria por la red interna. Vacía = memoria deshabilitada (x_conversation_id da 503)
+      - MEMORY_URL=http://memory:8000
+      # Usuario fijo de desarrollo: el cliente nunca lo manda (contrato de memoria, 4.1)
+      - DEV_USER_ID=dev-user
+      # Mensajes de historial que se leen por pedido (máximo 200)
+      - MEMORY_HISTORY_LIMIT=20
+      # Debe ser MAYOR que POOL_TIMEOUT_S de la memoria (4 s): con 1 s de margen, la memoria
+      # alcanza a contestar su 503 antes del corte (contrato de memoria, 3.5)
+      - MEMORY_TIMEOUT_S=5
+    # En dev se levanta el stack completo en orden: el orquestador arranca con la memoria lista.
+    depends_on:
+      memory:
+        condition: service_healthy
 
   # PostgreSQL de la memoria (desarrollo). Sin ports: solo accesible por la red interna de compose.
   postgres:
