@@ -7,6 +7,7 @@ Los proveedores son "tontos" (contrato, sección 1): todo lo que es política
 """
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
 
@@ -21,6 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 # conversation_id. Se importa en vez de duplicarlo para que no puedan divergir.
 from src.orchestrator.config import USER_ID_PATTERN as MEMORY_ID_PATTERN
 from src.orchestrator.config import Config, cargar_config
+from src.orchestrator.memory_client import MemoryClient, MemoryUnavailable, crear_cliente_memoria
 
 logger = logging.getLogger("orchestrator")
 
@@ -49,9 +51,18 @@ async def lifespan(app: FastAPI):
     app.state.config = cargar_config()
     # Un solo cliente para todo el proceso: reutiliza conexiones con los proveedores.
     app.state.client = crear_cliente(app.state.config)
+    # Memoria: solo si está habilitada. El cliente httpx2 se guarda aparte para cerrarlo al
+    # apagar sin tocar los atributos internos de MemoryClient.
+    app.state.memory_http = None
+    app.state.memory_client = None
+    if app.state.config.memory_url is not None:
+        app.state.memory_http = crear_cliente_memoria(app.state.config)
+        app.state.memory_client = MemoryClient(app.state.memory_http, app.state.config)
     app.state.started_at = int(time.time())
     yield
     await app.state.client.aclose()
+    if app.state.memory_http is not None:
+        await app.state.memory_http.aclose()
 
 
 app = FastAPI(
@@ -212,17 +223,36 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 503, "La memoria de conversaciones no está habilitada en este servidor.",
                 ERROR_TYPE_MEMORY, "memory_unavailable",
             )
-        # TODO bloque 3b
+
+    # 2c. Leer el historial (contrato de memoria, 4.2 paso 2). Si falla, 503 sin llamar al
+    #     proveedor: responder sin historial daría una respuesta desconectada de la conversación.
+    #     La causa ya la loguea MemoryClient; al cliente no se le expone.
+    memory_client: Optional[MemoryClient] = request.app.state.memory_client
+    usa_memoria = req.x_conversation_id is not None
+    historial: list[dict[str, str]] = []
+    if usa_memoria:
+        try:
+            guardados = await memory_client.leer_historial(req.x_conversation_id)
+        except MemoryUnavailable:
+            return error_response(
+                503, "La memoria de conversaciones no está disponible en este momento.",
+                ERROR_TYPE_MEMORY, "memory_unavailable",
+            )
+        # Solo role y content: created_at es de la memoria, no del contrato con proveedores.
+        historial = [{"role": m.role, "content": m.content} for m in guardados]
 
     # 3. Los extras se descartan en silencio para el cliente, pero quedan en el log para diagnosticar.
     if req.model_extra:
         logger.warning("Campos no soportados descartados: %r", sorted(req.model_extra))
-        
+
     # 4. Cuerpo para el proveedor: solo campos del contrato. Nuestro system va primero;
     #    los system del cliente se conservan detrás (política provisional, contrato sección 9 ❓).
+    #    Con memoria: [system] + historial + el único mensaje user (validado en 2b).
+    #    x_conversation_id es un campo declarado, no un extra: nunca llega acá.
     body: dict[str, Any] = {
         "model": modelo,
         "messages": [{"role": "system", "content": config.system_prompt}]
+        + historial
         + [m.model_dump() for m in req.messages],
         "stream": False,
     }
@@ -253,4 +283,63 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     except ValueError:
         return error_proveedor(502, "provider_error", modelo, f"respondió HTTP {resp.status_code} con un cuerpo que no es JSON")
 
+    if not usa_memoria:
+        return JSONResponse(status_code=resp.status_code, content=data)
+
+    # 8. Memoria: guardar el turno y agregar x_memory (contrato de memoria, 4.2 pasos 5-6 y 4.3).
+    #    Llegar acá implica que el proveedor respondió bien: si falló, ya se devolvió su error
+    #    sin guardar nada (4.2 paso 4).
+    conversation_id = req.x_conversation_id
+    if not isinstance(data, dict):
+        # Sin un objeto no hay dónde poner x_memory, y tampoco se puede extraer la respuesta
+        # del asistente: se devuelve tal cual, sin guardar, como en el pass-through de hoy.
+        logger.error(
+            "Respuesta del proveedor no es un objeto JSON: no se guarda el turno ni se agrega x_memory "
+            "(conversation_id=%r).", conversation_id,
+        )
+        return JSONResponse(status_code=resp.status_code, content=data)
+
+    data["x_memory"] = {"status": await guardar_turno_en_memoria(memory_client, conversation_id, req, data)}
     return JSONResponse(status_code=resp.status_code, content=data)
+
+
+def contenido_del_asistente(data: dict[str, Any]) -> Optional[str]:
+    """
+    choices[0].message.content, o None si falta o no es str. Un "" se acepta: la memoria
+    también lo acepta (Message.content: str sin largo mínimo, columna NOT NULL).
+    """
+    try:
+        contenido = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return contenido if isinstance(contenido, str) else None
+
+
+async def guardar_turno_en_memoria(
+    memory_client: MemoryClient, conversation_id: str, req: ChatCompletionRequest, data: dict[str, Any]
+) -> str:
+    """
+    Devuelve el x_memory.status: "saved" o "write_failed". Nunca falla el pedido: la respuesta
+    del proveedor ya existe y se devuelve igual (contrato de memoria, 4.4). Sin reintentos.
+    """
+    asistente = contenido_del_asistente(data)
+    if asistente is None:
+        # El proveedor rompió el contrato (no un fallo de la memoria): ERROR, sin contenido.
+        logger.error(
+            "Respuesta del proveedor sin choices[0].message.content de texto: no se guarda el turno "
+            "(conversation_id=%r).", conversation_id,
+        )
+        return "write_failed"
+
+    # Uno por pedido: identifica el turno y hace idempotente un futuro reintento (contrato 3.2).
+    turn_id = str(uuid.uuid4())
+    try:
+        await memory_client.guardar_turno(conversation_id, turn_id, req.messages[0].content, asistente)
+    except MemoryUnavailable:
+        # La causa ya la logueó MemoryClient; acá se agrega el turn_id para poder rastrearlo.
+        logger.warning(
+            "No se guardó el turno; se responde con write_failed (conversation_id=%r, turn_id=%s).",
+            conversation_id, turn_id,
+        )
+        return "write_failed"
+    return "saved"

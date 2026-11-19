@@ -1,6 +1,8 @@
 """Verifica el orquestador con un proveedor simulado (httpx2.MockTransport), sin red ni servicios reales."""
+import asyncio
 import json
 import logging
+import uuid
 
 import httpx2
 import pytest
@@ -8,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import src.orchestrator.app as orq
 from src.orchestrator.app import app
+from tests.test_memory_client import MemoriaFalsa
 
 URL = "/v1/chat/completions"
 SYSTEM_DE_PRUEBA = "Sos el system prompt de prueba."
@@ -266,14 +269,58 @@ def test_ruta_inexistente_usa_formato_de_error(proveedor):
 # ---------- x_conversation_id (contrato de memoria, 4.1 y 4.4) ----------
 
 CONV = "c-123"
+HOST_MEMORIA = "memoria-secreta.internal"
+DEV_USER = "dev-user"
+# Lo que devuelve la memoria falsa por defecto al leer: incluye created_at, que no debe llegar al proveedor.
+HISTORIAL_GUARDADO = [
+    {"role": "user", "content": "Me llamo Ana", "created_at": 1794305797},
+    {"role": "assistant", "content": "Hola, Ana.", "created_at": 1794305798},
+]
+
+
+def responder_memoria_por_defecto(request: httpx2.Request) -> httpx2.Response:
+    """GET: historial de prueba. POST: turno guardado (201)."""
+    if request.method == "GET":
+        return httpx2.Response(200, json={"conversation_id": CONV, "messages": HISTORIAL_GUARDADO})
+    return httpx2.Response(201, json={"conversation_id": CONV, "stored": 2})
 
 
 @pytest.fixture
-def memoria_habilitada(proveedor, monkeypatch):
-    """MEMORY_URL definida. En el bloque 3a el orquestador todavía no llama a la memoria."""
-    monkeypatch.setenv("MEMORY_URL", "http://memoria-secreta.internal:8000")
-    monkeypatch.setenv("DEV_USER_ID", "dev-user")
+def memoria(monkeypatch):
+    """
+    Memoria falsa (la de test_memory_client) inyectada sustituyendo crear_cliente_memoria,
+    igual que el fixture `proveedor` sustituye crear_cliente. Registra cada request recibido.
+    """
+    falsa = MemoriaFalsa()
+    falsa.responder = responder_memoria_por_defecto
+    falsa.clientes = []  # los httpx2.AsyncClient creados, para comprobar que se cierran
+
+    def crear(config):
+        cliente = httpx2.AsyncClient(transport=httpx2.MockTransport(falsa.handler))
+        falsa.clientes.append(cliente)
+        return cliente
+
+    monkeypatch.setattr(orq, "crear_cliente_memoria", crear)
+    return falsa
+
+
+@pytest.fixture
+def memoria_habilitada(proveedor, memoria, monkeypatch):
+    """MEMORY_URL definida, con la memoria falsa detrás. Devuelve el proveedor (como en el bloque 3a)."""
+    monkeypatch.setenv("MEMORY_URL", f"http://{HOST_MEMORIA}:8000")
+    monkeypatch.setenv("DEV_USER_ID", DEV_USER)
     return proveedor
+
+
+def posts_a_memoria(memoria):
+    return [r for r in memoria.recibidos if r.method == "POST"]
+
+
+def system_mas(*mensajes):
+    return [{"role": "system", "content": SYSTEM_DE_PRUEBA}, *mensajes]
+
+
+HISTORIAL_PROYECTADO = [{"role": m["role"], "content": m["content"]} for m in HISTORIAL_GUARDADO]
 
 
 def pedir(client, **campos):
@@ -384,10 +431,12 @@ def test_memoria_habilitada_acepta_el_campo_y_no_lo_reenvia(memoria_habilitada):
     with TestClient(app) as client:
         r = pedir(client, x_conversation_id=CONV)
     assert r.status_code == 200
-    assert r.json() == RESPUESTA_PROVEEDOR
+    assert r.json() == {**RESPUESTA_PROVEEDOR, "x_memory": {"status": "saved"}}
     (enviado,) = memoria_habilitada.recibidos
     assert "x_conversation_id" not in enviado
     assert set(enviado) == {"model", "messages", "stream"}
+    # Con memoria, el cuerpo lleva el historial entre nuestro system y el mensaje nuevo.
+    assert enviado["messages"] == system_mas(*HISTORIAL_PROYECTADO, *MENSAJES)
 
 
 def test_x_conversation_id_no_aparece_en_el_log_de_extras(memoria_habilitada, caplog):
@@ -399,3 +448,232 @@ def test_x_conversation_id_no_aparece_en_el_log_de_extras(memoria_habilitada, ca
     assert len(extras) == 1
     assert "top_p" in extras[0]
     assert "x_conversation_id" not in extras[0]
+
+
+# ---------- Flujo con memoria (contrato de memoria, 4.2 a 4.4) ----------
+
+CONTENIDO_SECRETO = "CONTENIDO-PRIVADO-DEL-USUARIO-42"
+
+
+def respuesta_con_contenido(contenido):
+    """Copia de RESPUESTA_PROVEEDOR con otro choices[0].message.content (puede ser inválido a propósito)."""
+    datos = json.loads(json.dumps(RESPUESTA_PROVEEDOR))
+    datos["choices"][0]["message"]["content"] = contenido
+    return datos
+
+
+def registros_propios(caplog):
+    # Solo loggers del orquestador: los INFO de httpx2 (con URL) son del bloque 3c.
+    return [rec for rec in caplog.records if rec.name.startswith("orchestrator")]
+
+
+def test_camino_feliz_con_historial(memoria_habilitada, memoria):
+    with TestClient(app) as client:
+        r = pedir(client, x_conversation_id=CONV, messages=[{"role": "user", "content": "¿Cómo me llamo?"}])
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body.pop("x_memory") == {"status": "saved"}
+    assert body == RESPUESTA_PROVEEDOR  # el resto es el JSON del proveedor tal cual
+
+    # Proveedor: [system] + historial sin created_at + nuevo, y sin x_conversation_id.
+    (enviado,) = memoria_habilitada.recibidos
+    assert enviado["messages"] == system_mas(*HISTORIAL_PROYECTADO, {"role": "user", "content": "¿Cómo me llamo?"})
+    assert "x_conversation_id" not in enviado
+
+    # Memoria: un GET y un POST, en ese orden.
+    get, post = memoria.recibidos
+    assert get.method == "GET"
+    assert dict(get.url.params) == {"user_id": DEV_USER, "limit": "20"}
+    assert post.method == "POST"
+    guardado = json.loads(post.content)
+    assert set(guardado) == {"user_id", "turn_id", "messages"}
+    assert guardado["user_id"] == DEV_USER
+    assert uuid.UUID(guardado["turn_id"]).version == 4
+    assert guardado["messages"] == [
+        {"role": "user", "content": "¿Cómo me llamo?"},
+        {"role": "assistant", "content": "Hola!"},
+    ]
+
+
+def test_historial_vacio(memoria_habilitada, memoria):
+    memoria.responder = lambda r: (
+        httpx2.Response(200, json={"conversation_id": CONV, "messages": []}) if r.method == "GET"
+        else httpx2.Response(201, json={"conversation_id": CONV, "stored": 2})
+    )
+    with TestClient(app) as client:
+        r = pedir(client, x_conversation_id=CONV)
+    assert r.status_code == 200
+    assert r.json()["x_memory"] == {"status": "saved"}
+    assert memoria_habilitada.recibidos[0]["messages"] == system_mas(*MENSAJES)
+    assert len(posts_a_memoria(memoria)) == 1
+
+
+async def _memoria_lenta(request):
+    await asyncio.sleep(2)
+    return httpx2.Response(200, json={"conversation_id": CONV, "messages": []})
+
+
+def _memoria_rechaza_conexion(request):
+    raise httpx2.ConnectError(f"Connection refused: {request.url}", request=request)
+
+
+@pytest.mark.parametrize(
+    "responder",
+    [
+        _memoria_rechaza_conexion,
+        _memoria_lenta,
+        lambda r: httpx2.Response(503, json={"error": {"message": "x"}}),
+        lambda r: httpx2.Response(200, text="<html>no soy json</html>"),
+    ],
+    ids=["conexion", "timeout", "estado_http", "respuesta_invalida"],
+)
+def test_lectura_fallida_da_503_sin_llamar_al_proveedor(memoria_habilitada, memoria, monkeypatch, responder):
+    monkeypatch.setenv("MEMORY_TIMEOUT_S", "0.1")  # para el caso timeout; los demás no esperan
+    memoria.responder = responder
+    with TestClient(app) as client:
+        r = pedir(client, x_conversation_id=CONV)
+
+    error = assert_error(r, 503, "memory_unavailable", None, type_="memory_error")
+    # La causa interna no llega al cliente.
+    for detalle in ("conexion", "timeout", "estado_http", "respuesta_invalida", HOST_MEMORIA):
+        assert detalle not in error["message"]
+    assert memoria_habilitada.recibidos == []
+    assert posts_a_memoria(memoria) == []
+
+
+@pytest.mark.parametrize(
+    "responder, status, code",
+    [
+        (_lanza(httpx2.ConnectError), 502, "provider_error"),
+        (_lanza(httpx2.ReadTimeout), 504, "provider_timeout"),
+        (lambda request: httpx2.Response(500, text="boom"), 502, "provider_error"),
+    ],
+    ids=["connect_error_502", "read_timeout_504", "status_500_502"],
+)
+def test_proveedor_falla_no_se_guarda_nada(memoria_habilitada, memoria, responder, status, code):
+    memoria_habilitada.responder = responder
+    with TestClient(app) as client:
+        r = pedir(client, x_conversation_id=CONV)
+
+    # Mismo error de hoy: sin x_memory ni nada agregado.
+    assert r.status_code == status
+    body = r.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == code
+    assert body["error"]["type"] == "provider_error"
+    assert body["error"]["x_provider"] == {"name": "mock"}
+    assert posts_a_memoria(memoria) == []
+    assert [r.method for r in memoria.recibidos] == ["GET"]  # sí se leyó el historial antes
+
+
+def test_guardado_fallido_da_200_con_write_failed(memoria_habilitada, memoria, caplog):
+    memoria.responder = lambda r: (
+        responder_memoria_por_defecto(r) if r.method == "GET"
+        else httpx2.Response(503, text=f"base caída {CONTENIDO_SECRETO}")
+    )
+    memoria_habilitada.responder = lambda r: httpx2.Response(200, json=respuesta_con_contenido(CONTENIDO_SECRETO))
+
+    with caplog.at_level(logging.WARNING):
+        with TestClient(app) as client:
+            r = pedir(client, x_conversation_id=CONV, messages=[{"role": "user", "content": CONTENIDO_SECRETO}])
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body.pop("x_memory") == {"status": "write_failed"}
+    assert body == respuesta_con_contenido(CONTENIDO_SECRETO)
+
+    (post,) = posts_a_memoria(memoria)
+    turn_id = json.loads(post.content)["turn_id"]
+    propios = registros_propios(caplog)
+    assert any(CONV in rec.getMessage() and turn_id in rec.getMessage() for rec in propios)
+    for rec in propios:
+        texto = rec.getMessage() + repr(rec.args)
+        assert CONTENIDO_SECRETO not in texto
+        assert HOST_MEMORIA not in texto
+        assert DEV_USER not in texto
+
+
+@pytest.mark.parametrize(
+    "respuesta",
+    [
+        {k: v for k, v in RESPUESTA_PROVEEDOR.items() if k != "choices"},
+        {**RESPUESTA_PROVEEDOR, "choices": []},
+        {**RESPUESTA_PROVEEDOR, "choices": [{"index": 0, "finish_reason": "stop"}]},
+        {**RESPUESTA_PROVEEDOR, "choices": "no es lista"},
+        respuesta_con_contenido(None),
+        respuesta_con_contenido(42),
+    ],
+    ids=["sin_choices", "choices_vacio", "sin_message", "choices_no_lista", "content_null", "content_no_str"],
+)
+def test_respuesta_del_proveedor_sin_content_valido(memoria_habilitada, memoria, caplog, respuesta):
+    memoria_habilitada.responder = lambda r: httpx2.Response(200, json=respuesta)
+    with caplog.at_level(logging.WARNING):
+        with TestClient(app) as client:
+            r = pedir(client, x_conversation_id=CONV)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body.pop("x_memory") == {"status": "write_failed"}
+    assert body == respuesta
+    assert posts_a_memoria(memoria) == []
+    errores = [rec for rec in registros_propios(caplog) if rec.levelno == logging.ERROR]
+    assert len(errores) == 1
+    assert CONV in errores[0].getMessage()
+
+
+def test_content_vacio_se_guarda(memoria_habilitada, memoria):
+    # La memoria acepta content "" (Message.content: str sin largo mínimo): se guarda igual.
+    memoria_habilitada.responder = lambda r: httpx2.Response(200, json=respuesta_con_contenido(""))
+    with TestClient(app) as client:
+        r = pedir(client, x_conversation_id=CONV)
+    assert r.json()["x_memory"] == {"status": "saved"}
+    (post,) = posts_a_memoria(memoria)
+    assert json.loads(post.content)["messages"][1] == {"role": "assistant", "content": ""}
+
+
+def test_respuesta_del_proveedor_que_no_es_objeto(memoria_habilitada, memoria, caplog):
+    # Sin un objeto no hay dónde poner x_memory: se devuelve tal cual, sin guardar, con ERROR.
+    memoria_habilitada.responder = lambda r: httpx2.Response(200, json=["no", "soy", "objeto"])
+    with caplog.at_level(logging.WARNING):
+        with TestClient(app) as client:
+            r = pedir(client, x_conversation_id=CONV)
+    assert r.status_code == 200
+    assert r.json() == ["no", "soy", "objeto"]
+    assert posts_a_memoria(memoria) == []
+    errores = [rec for rec in registros_propios(caplog) if rec.levelno == logging.ERROR]
+    assert len(errores) == 1 and CONV in errores[0].getMessage()
+
+
+def test_turn_id_distinto_por_pedido_y_unico_dentro_del_pedido(memoria_habilitada, memoria):
+    with TestClient(app) as client:
+        assert pedir(client, x_conversation_id=CONV).status_code == 200
+        assert pedir(client, x_conversation_id=CONV).status_code == 200
+
+    posts = posts_a_memoria(memoria)
+    assert len(posts) == 2  # un solo POST por pedido: un solo turn_id cada uno
+    turn_ids = [json.loads(p.content)["turn_id"] for p in posts]
+    assert turn_ids[0] != turn_ids[1]
+    assert all(uuid.UUID(t).version == 4 for t in turn_ids)
+
+
+def test_sin_x_conversation_id_no_toca_la_memoria(memoria_habilitada, memoria):
+    with TestClient(app) as client:
+        r = pedir(client)
+    assert r.status_code == 200
+    assert "x_memory" not in r.json()
+    assert memoria.recibidos == []
+
+
+def test_cliente_de_memoria_se_cierra_al_apagar(memoria_habilitada, memoria):
+    with TestClient(app) as client:
+        (cliente_memoria,) = memoria.clientes
+        assert not cliente_memoria.is_closed
+        pedir(client, x_conversation_id=CONV)
+    assert cliente_memoria.is_closed
+
+
+def test_sin_memory_url_no_se_crea_cliente_de_memoria(proveedor, memoria):
+    with TestClient(app) as client:
+        assert client.app.state.memory_client is None
+    assert memoria.clientes == []
