@@ -36,6 +36,9 @@ ENV TOP_P="0.9"
 # ⚠️ LOG_LEVEL=DEBUG imprime tracebacks que pueden incluir texto del usuario.
 ENV LOG_LEVEL="INFO"
 ENV PYTHONUNBUFFERED="1"
+# Allocator con segmentos expandibles: reduce la fragmentación de la VRAM. Medido en el paso 3e:
+# +17% de umbral de contexto con max_new_tokens=256 (2312 -> 2700 tokens de prompt).
+ENV PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 EXPOSE 8000
 

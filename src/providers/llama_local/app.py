@@ -240,10 +240,10 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
                 ERROR_TYPE_INVALID_REQUEST, "context_length_exceeded", "messages",
             )
         except VRAMInsuficiente as e:
-            # 503 y no 400: solo es transitorio cuando mem_get_info ve a los demás procesos (Linux
-            # nativo). Bajo WSL2/WDDM no los ve, y el chequeo cubre únicamente el estado del propio
-            # allocator. El límite permanente de esta GPU es el 400 context_length_exceeded.
-            # Solo números, sin traceback.
+            # 503: no hay capacidad para este pedido en este momento o en esta GPU. Viene de la
+            # verificación previa o de un OOM real al generar, y puede ser permanente para ese
+            # tamaño. El 400 context_length_exceeded es un límite ESTIMADO y conservador, no una
+            # garantía. Solo números, sin traceback ni texto de torch.
             logger.info(
                 "VRAM insuficiente: necesaria_mib=%.1f disponible_mib=%.1f.", e.necesaria_mb, e.disponible_mb
             )

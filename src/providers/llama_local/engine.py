@@ -31,6 +31,13 @@ MARGEN_VRAM_MB = 256
 # factor); el pico medido en vivo fue ~0,2275 MiB por token de entrada (activaciones y buffers
 # temporales además del KV). El factor 2 lleva la estimación a ~0,25 MiB: margen sobre lo medido.
 FACTOR_OVERHEAD_KV = 2.0
+# Reserva por pedido que se descuenta del presupuesto de contexto (no del límite de proceso).
+# Origen (paso 3e): ~119 MiB de costo fijo por pedido (ordenada del pico sobre la memoria en
+# reposo; hipótesis sin medir: descuantización temporal de bitsandbytes) más fragmentación
+# (17-58 MiB medidos) más holgura por la histéresis vista con expandable_segments tras varios
+# OOM seguidos. Medido para Llama 3 8B NF4 en una RTX 4070 Laptop bajo WSL2: NO extrapolar a
+# otras GPUs, modelos o drivers sin volver a medir.
+RESERVA_PEDIDO_MB = 150
 
 
 @dataclass
@@ -59,7 +66,10 @@ class SinGPU(Exception):
 
 
 class VRAMInsuficiente(Exception):
-    """La VRAM disponible ahora no alcanza para este pedido (p. ej. otro proceso la ocupó). Solo números."""
+    """
+    No hay capacidad de VRAM para este pedido: lo rechaza la verificación previa o lo provocó un
+    OOM real al generar. Puede ser permanente para ese tamaño en esta GPU. Solo números.
+    """
 
     def __init__(self, necesaria_mb: float, disponible_mb: float):
         self.necesaria_mb = necesaria_mb
@@ -147,21 +157,26 @@ def fraccion_de_limite(limite_b: float, total_b: float) -> float:
     return min(fraccion, 1.0)
 
 
-def presupuesto_vram_b(libre_b: float, cache_reutilizable_b: float, margen_b: float) -> float:
+def presupuesto_vram_b(libre_b: float, cache_reutilizable_b: float, margen_b: float, reserva_b: float) -> float:
     """
     VRAM utilizable para contexto: lo libre según el driver más lo que PyTorch ya tiene reservado
-    y no usa (lo reutiliza sin pedirle nada al driver), menos el margen. ÚNICA fórmula: la usan
-    el tope de arranque y la verificación por pedido, para que no puedan contradecirse.
-    Puede dar negativo; contexto_por_vram lo rechaza.
+    y no usa (lo reutiliza sin pedirle nada al driver), menos el margen y la reserva por pedido.
+    ÚNICA fórmula: la usan el tope de arranque y la verificación por pedido, para que no puedan
+    contradecirse. Puede dar negativo; cargar() lo rechaza con un mensaje claro.
     """
-    return libre_b + cache_reutilizable_b - margen_b
+    return libre_b + cache_reutilizable_b - margen_b - reserva_b
 
 
 def vram_alcanza(
-    tokens_pedido: int, costo_por_token_b: float, libre_b: float, cache_reutilizable_b: float, margen_b: float
+    tokens_pedido: int,
+    costo_por_token_b: float,
+    libre_b: float,
+    cache_reutilizable_b: float,
+    margen_b: float,
+    reserva_b: float,
 ) -> bool:
     """Si el presupuesto de este momento alcanza para el pedido (prompt + max_tokens)."""
-    return tokens_pedido * costo_por_token_b <= presupuesto_vram_b(libre_b, cache_reutilizable_b, margen_b)
+    return tokens_pedido * costo_por_token_b <= presupuesto_vram_b(libre_b, cache_reutilizable_b, margen_b, reserva_b)
 
 
 # ---------- Motor real (requiere GPU) ----------
@@ -200,7 +215,7 @@ class MotorLlama:
         # Límite de VRAM del proceso, ANTES de cualquier from_pretrained. Bajo el driver de
         # Windows la VRAM puede derramarse a la RAM del sistema en vez de dar OOM, con latencias
         # de minutos (medido: 423 s con ~8000 tokens). Con el límite, PyTorch lanza
-        # OutOfMemoryError, que generar() ya maneja (empty_cache + 500 inference_error).
+        # OutOfMemoryError, que _generar() convierte en VRAMInsuficiente (empty_cache + 503).
         # Primera pasada: protege la carga. Se reajusta con el valor preciso tras el calentamiento.
         fraccion = fraccion_vram(libre_b, total_b, MARGEN_VRAM_MB * MIB)
         torch.cuda.set_per_process_memory_fraction(fraccion, 0)
@@ -240,12 +255,15 @@ class MotorLlama:
         # ve. Se hace por el mismo camino que generar(), ANTES de medir la VRAM para el tope,
         # para que ese consumo ya esté descontado y el primer pedido real no pague el arranque.
         self._model, self._tokenizer, self._eos_ids = model, tokenizer, eos
+        # El costo ya se conoce; _generar lo necesita si un OOM del calentamiento se convierte en VRAMInsuficiente.
+        self._costo_por_token_b = costo_b
         t_calentamiento = time.perf_counter()
         try:
             self._generar(MENSAJES_CALENTAMIENTO, 0, 8, contexto_max=contexto_modelo, verificar_vram=False)
         except Exception:
             # Sin modelo a medias: el estado queda "failed" y el tope sin fijar.
             self._model, self._tokenizer, self._eos_ids = None, None, set()
+            self._costo_por_token_b = None
             raise
         logger.info("Calentamiento: %.2f s.", time.perf_counter() - t_calentamiento)
 
@@ -254,25 +272,37 @@ class MotorLlama:
         reservada_b = torch.cuda.memory_reserved()
         cache_reutilizable_b = reservada_b - torch.cuda.memory_allocated()
         margen_b = MARGEN_VRAM_MB * MIB
-        presupuesto_b = presupuesto_vram_b(libre_b, cache_reutilizable_b, margen_b)
+        reserva_b = RESERVA_PEDIDO_MB * MIB
+        presupuesto_b = presupuesto_vram_b(libre_b, cache_reutilizable_b, margen_b, reserva_b)
+        if presupuesto_b < costo_b:
+            # Mensaje con todos los números: es el motivo del estado "failed" en el log.
+            self._model, self._tokenizer, self._eos_ids, self._costo_por_token_b = None, None, set(), None
+            raise RuntimeError(
+                f"No queda VRAM para contexto tras cargar el modelo: presupuesto {presupuesto_b / MIB:.1f} MiB "
+                f"(libre {libre_b / MIB:.1f} + cache reutilizable {cache_reutilizable_b / MIB:.1f} "
+                f"- margen {margen_b / MIB:.1f} - reserva {reserva_b / MIB:.1f}), menos que un token "
+                f"({costo_b / MIB:.4f} MiB)."
+            )
+        # El tope es una ESTIMACIÓN conservadora (paso 3e), no una garantía: un pedido que entra
+        # puede igual dar OOM, que llega al cliente como 503 insufficient_vram.
         por_vram = contexto_por_vram(presupuesto_b, costo_b, contexto_modelo)
         efectivo = contexto_efectivo(contexto_modelo, por_vram, self.contexto_max_config)
         logger.info(
-            "Tope de contexto: libre_mib=%.1f cache_reutilizable_mib=%.1f margen_mib=%.1f presupuesto_mib=%.1f "
-            "costo_mib_por_token=%.4f contexto_modelo=%d por_vram=%d configurado=%s efectivo=%d",
-            libre_b / MIB, cache_reutilizable_b / MIB, margen_b / MIB, presupuesto_b / MIB, costo_b / MIB,
-            contexto_modelo, por_vram, self.contexto_max_config, efectivo,
+            "Tope de contexto: libre_mib=%.1f cache_reutilizable_mib=%.1f margen_mib=%.1f reserva_mib=%.1f "
+            "presupuesto_mib=%.1f costo_mib_por_token=%.4f contexto_modelo=%d por_vram=%d configurado=%s efectivo=%d",
+            libre_b / MIB, cache_reutilizable_b / MIB, margen_b / MIB, reserva_b / MIB, presupuesto_b / MIB,
+            costo_b / MIB, contexto_modelo, por_vram, self.contexto_max_config, efectivo,
         )
 
         # Segunda pasada del límite: lo máximo que PyTorch puede llegar a reservar sin pasar la
-        # VRAM física menos el margen (lo que ya reservó más lo libre, menos el margen).
+        # VRAM física menos el margen (lo que ya reservó más lo libre, menos el margen). Sin la
+        # reserva por pedido: es holgura del presupuesto, sumarla acá la penalizaría dos veces.
         limite_b = reservada_b + libre_b - margen_b
         fraccion = fraccion_de_limite(limite_b, total_b)
         torch.cuda.set_per_process_memory_fraction(fraccion, 0)
         logger.info("Límite de VRAM del proceso (final): %.1f MiB (fracción %.4f del total).", limite_b / MIB, fraccion)
 
         self.contexto_max = efectivo
-        self._costo_por_token_b = costo_b
 
     def generar(self, mensajes: list[dict], temperature: Optional[float], max_tokens: Optional[int]) -> Resultado:
         """
@@ -305,19 +335,20 @@ class MotorLlama:
         validar_contexto(prompt_tokens, max_new, contexto_max)
 
         # VRAM de ESTE momento, antes de mover nada a la GPU. Solo cubre lo que ve mem_get_info:
-        # en Linux nativo incluye a los demás procesos (ahí un 503 sí es transitorio), pero bajo
-        # WSL2/WDDM no los ve (medido en el paso 3c): el chequeo cubre únicamente el estado del
-        # propio allocator. El 400 context_length_exceeded es el límite permanente de esta GPU.
+        # en Linux nativo incluye a los demás procesos, pero bajo WSL2/WDDM no los ve (medido en
+        # el paso 3c): el chequeo cubre únicamente el estado del propio allocator. El 400
+        # context_length_exceeded es un límite ESTIMADO y conservador, no una garantía.
         libre_b = torch.cuda.mem_get_info(0)[0]
         cache_reutilizable_b = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
         tokens_pedido = prompt_tokens + max_new
         margen_b = MARGEN_VRAM_MB * MIB
+        reserva_b = RESERVA_PEDIDO_MB * MIB
         if verificar_vram and not vram_alcanza(
-            tokens_pedido, self._costo_por_token_b, libre_b, cache_reutilizable_b, margen_b
+            tokens_pedido, self._costo_por_token_b, libre_b, cache_reutilizable_b, margen_b, reserva_b
         ):
             raise VRAMInsuficiente(
                 tokens_pedido * self._costo_por_token_b / MIB,
-                presupuesto_vram_b(libre_b, cache_reutilizable_b, margen_b) / MIB,
+                presupuesto_vram_b(libre_b, cache_reutilizable_b, margen_b, reserva_b) / MIB,
             )
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
@@ -343,10 +374,23 @@ class MotorLlama:
             if hay_cuda:
                 # generate es asíncrono en GPU: esperar antes de parar el cronómetro.
                 torch.cuda.synchronize()
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as e:
             # Devolver al pool lo que quedó reservado, para que el próximo pedido tenga chance.
             torch.cuda.empty_cache()
-            raise
+            # La estimación no alcanzó: OOM real del límite de proceso. Se informa como falta de
+            # capacidad (503), con los números; nunca el texto de torch (de ahí el `from` sin str).
+            necesaria_mb = tokens_pedido * self._costo_por_token_b / MIB
+            disponible_mb = presupuesto_vram_b(
+                torch.cuda.mem_get_info(0)[0],
+                torch.cuda.memory_reserved() - torch.cuda.memory_allocated(),
+                margen_b,
+                reserva_b,
+            ) / MIB
+            logger.warning(
+                "OOM al generar: la estimación de VRAM no alcanzó (tokens_pedido=%d necesaria_mib=%.1f "
+                "disponible_mib=%.1f).", tokens_pedido, necesaria_mb, disponible_mb,
+            )
+            raise VRAMInsuficiente(necesaria_mb, disponible_mb) from e
         generation_s = time.perf_counter() - t_inicio
 
         nuevos = outputs[0][prompt_tokens:]
