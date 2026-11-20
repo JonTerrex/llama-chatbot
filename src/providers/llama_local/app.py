@@ -240,14 +240,16 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
                 ERROR_TYPE_INVALID_REQUEST, "context_length_exceeded", "messages",
             )
         except VRAMInsuficiente as e:
-            # Transitorio: otro proceso ocupó VRAM después del arranque. El mismo pedido puede
-            # funcionar más tarde, por eso 503 y no 400. Solo números, sin traceback.
+            # 503 y no 400: solo es transitorio cuando mem_get_info ve a los demás procesos (Linux
+            # nativo). Bajo WSL2/WDDM no los ve, y el chequeo cubre únicamente el estado del propio
+            # allocator. El límite permanente de esta GPU es el 400 context_length_exceeded.
+            # Solo números, sin traceback.
             logger.info(
                 "VRAM insuficiente: necesaria_mib=%.1f disponible_mib=%.1f.", e.necesaria_mb, e.disponible_mb
             )
             return error_response(
                 503,
-                f"No hay VRAM suficiente en este momento: el pedido necesita {e.necesaria_mb:.0f} MiB "
+                f"VRAM insuficiente: el pedido necesita {e.necesaria_mb:.0f} MiB "
                 f"y hay {e.disponible_mb:.0f} MiB disponibles.",
                 ERROR_TYPE_PROVIDER, "insufficient_vram",
             )

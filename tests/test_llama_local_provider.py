@@ -310,7 +310,9 @@ def test_vram_insuficiente_da_503_con_los_numeros_y_sin_contenido(motor, caplog)
         with cliente() as c:
             r = pedir(c, messages=[{"role": "user", "content": SECRETO}])
     error = assert_error(r, 503, "insufficient_vram", None, "provider_error")
-    assert "3140" in error["message"] and "1200" in error["message"]
+    # Solo los números: nada que prometa que es transitorio (bajo WSL2 puede no serlo).
+    assert error["message"] == "VRAM insuficiente: el pedido necesita 3140 MiB y hay 1200 MiB disponibles."
+    assert "transitori" not in error["message"].lower() and "momento" not in error["message"].lower()
     assert "x_provider" not in error
     assert SECRETO not in r.text
     assert SECRETO not in caplog.text
