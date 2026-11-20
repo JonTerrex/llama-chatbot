@@ -27,6 +27,10 @@ services:
     volumes:
       # El modelo se monta, no va en la imagen.
       - ./modelos:/app/modelos:ro
+    environment:
+      # Override manual opcional del tope de contexto (tokens). Vacío = automático: por
+      # defecto el tope sale de la VRAM disponible al terminar la carga.
+      CONTEXTO_MAX_TOKENS: ${CONTEXTO_MAX_TOKENS:-}
     deploy:
       resources:
         reservations:
@@ -47,6 +51,6 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
-      # Carga en frío medida: ~194 s sobre bind mount de Windows. 420 s deja margen para discos
-      # más lentos; los fallos durante este período no cuentan.
-      start_period: 420s
+      # Cargas medidas: de 194 a 375 s sobre bind mount de Windows. 600 s deja margen; los
+      # fallos durante este período no cuentan.
+      start_period: 600s

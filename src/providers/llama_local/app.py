@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from src.providers.llama_local.engine import ContextoExcedido, MotorLlama
+from src.providers.llama_local.engine import ContextoExcedido, MotorLlama, VRAMInsuficiente
 
 logger = logging.getLogger("llama_local")
 
@@ -76,7 +76,18 @@ def crear_motor() -> MotorLlama:
         raise ValueError(f"TOP_P={raw!r} no es un número.") from e
     if not 0 < top_p <= 1:
         raise ValueError(f"TOP_P={raw!r} fuera de rango: debe ser mayor que 0 y como máximo 1.")
-    return MotorLlama(path_modelo, top_p)
+
+    # Override manual del tope de contexto. Ausente o vacío: lo decide la VRAM al cargar.
+    raw_ctx = os.getenv("CONTEXTO_MAX_TOKENS") or None
+    contexto_max_config = None
+    if raw_ctx is not None:
+        try:
+            contexto_max_config = int(raw_ctx)
+        except ValueError as e:
+            raise ValueError(f"CONTEXTO_MAX_TOKENS={raw_ctx!r} no es un entero.") from e
+        if contexto_max_config <= 0:
+            raise ValueError(f"CONTEXTO_MAX_TOKENS={raw_ctx!r} debe ser un entero mayor que 0.")
+    return MotorLlama(path_modelo, top_p, contexto_max_config)
 
 
 def _cargar_en_segundo_plano(app: FastAPI) -> None:
@@ -108,6 +119,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.hilo_carga.start()
     yield
+    logger.info("Apagando el proveedor.")
     if app.state.estado == "ready":
         app.state.motor.liberar()
 
@@ -226,6 +238,18 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
                 f"La petición no entra en el contexto del modelo: {e.prompt_tokens} tokens de entrada "
                 f"+ {e.max_new_tokens} de max_tokens superan el límite de {e.limite}.",
                 ERROR_TYPE_INVALID_REQUEST, "context_length_exceeded", "messages",
+            )
+        except VRAMInsuficiente as e:
+            # Transitorio: otro proceso ocupó VRAM después del arranque. El mismo pedido puede
+            # funcionar más tarde, por eso 503 y no 400. Solo números, sin traceback.
+            logger.info(
+                "VRAM insuficiente: necesaria_mib=%.1f disponible_mib=%.1f.", e.necesaria_mb, e.disponible_mb
+            )
+            return error_response(
+                503,
+                f"No hay VRAM suficiente en este momento: el pedido necesita {e.necesaria_mb:.0f} MiB "
+                f"y hay {e.disponible_mb:.0f} MiB disponibles.",
+                ERROR_TYPE_PROVIDER, "insufficient_vram",
             )
         except Exception as e:
             # Solo la clase: el texto de una excepción de generación puede traer contenido del prompt.

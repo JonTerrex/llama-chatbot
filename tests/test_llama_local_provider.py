@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 import src.providers.llama_local.app as prov
 from src.providers.llama_local.app import app
-from src.providers.llama_local.engine import ContextoExcedido, MotorLlama, Resultado
+from src.providers.llama_local.engine import ContextoExcedido, MotorLlama, Resultado, VRAMInsuficiente
 
 URL = "/v1/chat/completions"
 MODELO = "llama3-8b-local"
@@ -304,6 +304,23 @@ def test_contexto_excedido_da_400_sin_contenido(motor):
     assert SECRETO not in r.text
 
 
+def test_vram_insuficiente_da_503_con_los_numeros_y_sin_contenido(motor, caplog):
+    motor.error_generar = VRAMInsuficiente(3140.5, 1200.0)
+    with caplog.at_level(logging.INFO):
+        with cliente() as c:
+            r = pedir(c, messages=[{"role": "user", "content": SECRETO}])
+    error = assert_error(r, 503, "insufficient_vram", None, "provider_error")
+    assert "3140" in error["message"] and "1200" in error["message"]
+    assert "x_provider" not in error
+    assert SECRETO not in r.text
+    assert SECRETO not in caplog.text
+    propios = [rec for rec in caplog.records if rec.name == "llama_local" and "VRAM insuficiente" in rec.getMessage()]
+    assert len(propios) == 1
+    assert propios[0].levelno == logging.INFO and not propios[0].exc_info
+    # El proveedor sigue atendiendo: es transitorio.
+    assert motor.llamadas and len(motor.llamadas) == 1
+
+
 def test_excepcion_generica_da_500_sin_su_texto(motor, caplog):
     motor.error_generar = RuntimeError(f"CUDA explotó con el prompt {SECRETO}")
     with caplog.at_level(logging.INFO):
@@ -350,16 +367,46 @@ def test_dos_pedidos_simultaneos_no_generan_a_la_vez(motor):
 def test_crear_motor_lee_el_entorno(monkeypatch):
     monkeypatch.setenv("MODEL_PATH", "/modelos/otro")
     monkeypatch.setenv("TOP_P", "0.5")
+    monkeypatch.setenv("CONTEXTO_MAX_TOKENS", "2048")
     m = prov.crear_motor()
     assert isinstance(m, MotorLlama)
-    assert (m.path_modelo, m.top_p) == ("/modelos/otro", 0.5)
+    assert (m.path_modelo, m.top_p, m.contexto_max_config) == ("/modelos/otro", 0.5, 2048)
 
 
 def test_crear_motor_defaults(monkeypatch):
     monkeypatch.delenv("MODEL_PATH", raising=False)
     monkeypatch.delenv("TOP_P", raising=False)
+    monkeypatch.delenv("CONTEXTO_MAX_TOKENS", raising=False)
     m = prov.crear_motor()
-    assert (m.path_modelo, m.top_p) == ("modelos/llama3", 0.9)
+    assert (m.path_modelo, m.top_p, m.contexto_max_config) == ("modelos/llama3", 0.9, None)
+
+
+@pytest.mark.parametrize("valor, esperado", [(None, None), ("", None), ("2048", 2048)], ids=["ausente", "vacio", "2048"])
+def test_contexto_max_tokens_valido(monkeypatch, valor, esperado):
+    if valor is None:
+        monkeypatch.delenv("CONTEXTO_MAX_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("CONTEXTO_MAX_TOKENS", valor)
+    assert prov.crear_motor().contexto_max_config == esperado
+
+
+@pytest.mark.parametrize("valor", ["0", "-5", "abc", "1.5"])
+def test_contexto_max_tokens_invalido_impide_arrancar(monkeypatch, valor):
+    monkeypatch.setenv("CONTEXTO_MAX_TOKENS", valor)
+    with pytest.raises(ValueError, match=f"CONTEXTO_MAX_TOKENS='{valor}'"):
+        prov.crear_motor()
+    with pytest.raises(ValueError, match="CONTEXTO_MAX_TOKENS"):
+        with TestClient(app):
+            pass
+
+
+def test_al_apagar_se_loguea_antes_de_liberar(motor, caplog):
+    with caplog.at_level(logging.INFO, logger="llama_local"):
+        with cliente():
+            pass
+    mensajes = [rec.getMessage() for rec in caplog.records if rec.name == "llama_local"]
+    assert "Apagando el proveedor." in mensajes
+    assert motor.liberado
 
 
 @pytest.mark.parametrize("valor", ["0", "1.5", "-0.1", "mucho"])

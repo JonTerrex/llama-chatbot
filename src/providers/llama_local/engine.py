@@ -22,6 +22,14 @@ MAX_TOKENS_DEFAULT = 256
 # Mismo umbral que chatbot.py: por debajo, Llama 3 8B en 4 bits no entra con margen.
 VRAM_MIN_GB = 5.0
 
+MIB = 1024 ** 2
+# VRAM que se deja sin usar, para Windows y para la fragmentación del allocator de PyTorch.
+MARGEN_VRAM_MB = 256
+# El KV cache de Llama 3 8B en bf16 cuesta ~0,125 MiB por token (fórmula de bytes_por_token sin
+# factor); el pico medido en vivo fue ~0,2275 MiB por token de entrada (activaciones y buffers
+# temporales además del KV). El factor 2 lleva la estimación a ~0,25 MiB: margen sobre lo medido.
+FACTOR_OVERHEAD_KV = 2.0
+
 
 @dataclass
 class Resultado:
@@ -46,6 +54,15 @@ class ContextoExcedido(Exception):
 
 class SinGPU(Exception):
     """No hay CUDA. A diferencia de chatbot.py no hay fallback a CPU: 8B en float32 no es usable."""
+
+
+class VRAMInsuficiente(Exception):
+    """La VRAM disponible ahora no alcanza para este pedido (p. ej. otro proceso la ocupó). Solo números."""
+
+    def __init__(self, necesaria_mb: float, disponible_mb: float):
+        self.necesaria_mb = necesaria_mb
+        self.disponible_mb = disponible_mb
+        super().__init__(f"necesaria_mb={necesaria_mb:.1f}, disponible_mb={disponible_mb:.1f}")
 
 
 # ---------- Reglas puras (testeables sin torch) ----------
@@ -81,15 +98,69 @@ def decidir_finish_reason(
     return "stop"
 
 
+def bytes_por_token(
+    num_capas: int, num_kv_heads: int, head_dim: int, bytes_dtype: int = 2, factor: float = FACTOR_OVERHEAD_KV
+) -> float:
+    """
+    Costo estimado en VRAM de un token de contexto: K y V (el 2 inicial) por capa, por cabeza
+    de KV y por dimensión, en bf16 (2 bytes, el compute dtype), multiplicado por `factor`.
+    """
+    return 2 * num_capas * num_kv_heads * head_dim * bytes_dtype * factor
+
+
+def contexto_por_vram(presupuesto_b: float, costo_por_token_b: float, contexto_modelo: int) -> int:
+    """Cuántos tokens de contexto entran en el presupuesto, sin pasar del contexto del modelo."""
+    tokens = min(contexto_modelo, int(presupuesto_b // costo_por_token_b))
+    if tokens < 1:
+        raise ValueError(
+            f"La VRAM que queda tras cargar el modelo ({presupuesto_b / MIB:.1f} MiB) no alcanza "
+            f"ni para un token de contexto ({costo_por_token_b / MIB:.4f} MiB por token)."
+        )
+    return tokens
+
+
+def contexto_efectivo(contexto_modelo: Optional[int], por_vram: Optional[int], configurado: Optional[int]) -> int:
+    """El menor de los topes conocidos: un CONTEXTO_MAX_TOKENS mayor que el automático no lo amplía."""
+    candidatos = [c for c in (contexto_modelo, por_vram, configurado) if c is not None]
+    if not candidatos:
+        raise ValueError("No hay ningún tope de contexto conocido.")
+    return min(candidatos)
+
+
+def fraccion_vram(libre_b: float, total_b: float, margen_b: float) -> float:
+    """Fracción del total de la GPU que puede usar este proceso: lo libre al arrancar menos el margen."""
+    fraccion = (libre_b - margen_b) / total_b
+    if not fraccion > 0:
+        raise ValueError(
+            f"Sin VRAM utilizable: {libre_b / MIB:.1f} MiB libres menos {margen_b / MIB:.1f} MiB de margen."
+        )
+    return fraccion
+
+
+def vram_alcanza(
+    tokens_pedido: int, costo_por_token_b: float, libre_b: float, cache_reutilizable_b: float, margen_b: float
+) -> bool:
+    """
+    Si la VRAM de este momento alcanza para el pedido. Cuenta lo libre en el dispositivo más lo
+    que PyTorch ya tiene reservado y no usa (lo reutiliza sin pedirle al driver), menos el margen.
+    """
+    necesaria = tokens_pedido * costo_por_token_b
+    disponible = libre_b + cache_reutilizable_b - margen_b
+    return necesaria <= disponible
+
+
 # ---------- Motor real (requiere GPU) ----------
 
 class MotorLlama:
-    def __init__(self, path_modelo: str, top_p: float):
+    def __init__(self, path_modelo: str, top_p: float, contexto_max_config: Optional[int] = None):
         self.path_modelo = path_modelo
         self.top_p = top_p
+        # Override manual (CONTEXTO_MAX_TOKENS): solo puede achicar el tope automático.
+        self.contexto_max_config = contexto_max_config
         self._model: Any = None
         self._tokenizer: Any = None
         self._eos_ids: set[int] = set()
+        self._costo_por_token_b: Optional[float] = None
         self.contexto_max: Optional[int] = None
 
     def cargar(self) -> None:
@@ -110,6 +181,15 @@ class MotorLlama:
             "Cargando modelo en %s (VRAM libre %.2f GB de %.2f GB, torch %s, CUDA %s).",
             torch.cuda.get_device_name(0), libre_gb, total_gb, torch.__version__, torch.version.cuda,
         )
+
+        # Límite de VRAM del proceso, ANTES de cualquier from_pretrained. Bajo el driver de
+        # Windows la VRAM puede derramarse a la RAM del sistema en vez de dar OOM, con latencias
+        # de minutos (medido: 423 s con ~8000 tokens). Con el límite, PyTorch lanza
+        # OutOfMemoryError, que generar() ya maneja (empty_cache + 500 inference_error).
+        fraccion = fraccion_vram(libre_b, total_b, MARGEN_VRAM_MB * MIB)
+        torch.cuda.set_per_process_memory_fraction(fraccion, 0)
+        limite_b = fraccion * total_b
+        logger.info("Límite de VRAM del proceso: %.1f MiB (fracción %.4f del total).", limite_b / MIB, fraccion)
 
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -133,7 +213,23 @@ class MotorLlama:
             elif fuente is not None:
                 eos.update(int(x) for x in fuente)
 
-        self.contexto_max = int(model.config.max_position_embeddings)
+        # Tope de contexto según la VRAM que quedó tras cargar el modelo.
+        config = model.config
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        costo_b = bytes_por_token(config.num_hidden_layers, config.num_key_value_heads, head_dim)
+        asignada_b = torch.cuda.memory_allocated()
+        contexto_modelo = int(config.max_position_embeddings)
+        por_vram = contexto_por_vram(limite_b - asignada_b, costo_b, contexto_modelo)
+        efectivo = contexto_efectivo(contexto_modelo, por_vram, self.contexto_max_config)
+        logger.info(
+            "Tope de contexto: libre_mib=%.1f limite_mib=%.1f asignada_mib=%.1f costo_mib_por_token=%.4f "
+            "contexto_modelo=%d por_vram=%d configurado=%s efectivo=%d",
+            libre_b / MIB, limite_b / MIB, asignada_b / MIB, costo_b / MIB,
+            contexto_modelo, por_vram, self.contexto_max_config, efectivo,
+        )
+
+        self.contexto_max = efectivo
+        self._costo_por_token_b = costo_b
         self._eos_ids = eos
         self._tokenizer = tokenizer
         self._model = model
@@ -156,6 +252,18 @@ class MotorLlama:
         )
         prompt_tokens = int(inputs["input_ids"].shape[-1])
         validar_contexto(prompt_tokens, max_new, self.contexto_max)
+
+        # VRAM de ESTE momento, antes de mover nada a la GPU: otro proceso (un juego) pudo
+        # ocuparla después del arranque, y entonces el tope calculado al cargar ya no alcanza.
+        libre_b = torch.cuda.mem_get_info(0)[0]
+        cache_reutilizable_b = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        tokens_pedido = prompt_tokens + max_new
+        margen_b = MARGEN_VRAM_MB * MIB
+        if not vram_alcanza(tokens_pedido, self._costo_por_token_b, libre_b, cache_reutilizable_b, margen_b):
+            raise VRAMInsuficiente(
+                tokens_pedido * self._costo_por_token_b / MIB,
+                (libre_b + cache_reutilizable_b - margen_b) / MIB,
+            )
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
         pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
@@ -207,8 +315,14 @@ class MotorLlama:
             return
         import torch
 
+        # Logs de cada paso: el apagado da exit 137 y hay que ver en cuál se corta.
         self._model = None
         self._tokenizer = None
+        logger.info("Liberando: gc.collect() empieza.")
         gc.collect()
+        logger.info("Liberando: gc.collect() terminó.")
         if torch.cuda.is_available():
+            logger.info("Liberando: torch.cuda.empty_cache() empieza.")
             torch.cuda.empty_cache()
+            logger.info("Liberando: torch.cuda.empty_cache() terminó.")
+        logger.info("Modelo liberado.")
