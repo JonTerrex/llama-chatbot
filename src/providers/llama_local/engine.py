@@ -364,17 +364,31 @@ class MotorLlama:
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
         t_inicio = time.perf_counter()
+        outputs: Any = None
+        hubo_oom = False
         try:
             outputs = model.generate(**inputs, **kwargs)
             if hay_cuda:
                 # generate es asíncrono en GPU: esperar antes de parar el cronómetro.
                 torch.cuda.synchronize()
-        except torch.cuda.OutOfMemoryError as e:
-            # Devolver al pool lo que quedó reservado, para que el próximo pedido tenga chance.
+        except torch.cuda.OutOfMemoryError:
+            # Solo se marca y se SALE del except. Mientras la excepción está viva, su traceback
+            # referencia los frames de transformers y con ellos los tensores del generate fallido:
+            # un empty_cache() acá no puede devolverlos (paso 3g: tras el OOM quedaban ~420 MiB
+            # reservados de más, asignada 6187 contra 5749 MiB en reposo).
+            hubo_oom = True
+        if hubo_oom:
+            # Fuera del except la excepción ya se soltó. Se sueltan también las referencias
+            # locales a tensores del intento, gc rompe ciclos que los retengan, y recién entonces
+            # empty_cache devuelve la VRAM al driver.
+            del inputs, outputs
+            gc.collect()
             torch.cuda.empty_cache()
             # La estimación no alcanzó: OOM real del límite de proceso. Se informa como falta de
-            # capacidad (503), con los números; nunca el texto de torch (de ahí el `from` sin str).
-            # Sin volver a medir la VRAM: se informa el presupuesto con el que se fijó el tope.
+            # capacidad (503), con los números; nunca el texto de torch. Se lanza fuera del
+            # except y sin `from`: la excepción de torch no queda en __cause__ ni en __context__
+            # (la retendría viva con sus tensores). Sin volver a medir la VRAM: se informa el
+            # presupuesto con el que se fijó el tope.
             necesaria_mb = tokens_pedido * self._costo_por_token_b / MIB
             presupuesto_mb = None if self._presupuesto_arranque_b is None else self._presupuesto_arranque_b / MIB
             logger.warning(
@@ -382,7 +396,7 @@ class MotorLlama:
                 "necesaria_estimada_mib=%.1f presupuesto_arranque_mib=%s).",
                 tokens_pedido, necesaria_mb, "None" if presupuesto_mb is None else f"{presupuesto_mb:.1f}",
             )
-            raise VRAMInsuficiente(tokens_pedido, necesaria_mb, presupuesto_mb) from e
+            raise VRAMInsuficiente(tokens_pedido, necesaria_mb, presupuesto_mb)
         generation_s = time.perf_counter() - t_inicio
 
         nuevos = outputs[0][prompt_tokens:]

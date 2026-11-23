@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import src.providers.llama_local.engine as engine
 from src.providers.llama_local.engine import (
     MARGEN_VRAM_MB,
     RESERVA_PEDIDO_MB,
@@ -262,6 +263,12 @@ class GPUFalsa:
         self.despues, self.durante, self.error_generate = despues, durante, error_generate
         self.motor = None  # si se asigna, generate registra su contexto_max en ese momento
         self.kwargs_generate: list[dict] = []
+        # sys.exc_info() en el momento de cada empty_cache: con una excepción viva no libera nada.
+        self.exc_info_en_empty_cache: list[tuple] = []
+
+    def _empty_cache(self):
+        self.orden.append(("empty_cache",))
+        self.exc_info_en_empty_cache.append(sys.exc_info())
 
     def _aplicar(self, cambios):
         for k, v in (cambios or {}).items():
@@ -281,7 +288,7 @@ class GPUFalsa:
             memory_allocated=lambda device=None: self.asignada_b,
             memory_reserved=lambda device=None: self.reservada_b,
             max_memory_allocated=lambda device=None: self.asignada_b,
-            empty_cache=lambda: o.append(("empty_cache",)),
+            empty_cache=self._empty_cache,
             synchronize=lambda: None,
             reset_peak_memory_stats=lambda: None,
             OutOfMemoryError=type("OutOfMemoryError", (RuntimeError,), {}),
@@ -578,7 +585,6 @@ def test_oom_al_generar_se_convierte_en_vram_insuficiente(monkeypatch, caplog):
         soltar_logs(caplog, log, estado)
     assert ("empty_cache",) in gpu.orden
     assert ("mem_get_info", gpu.libre_b) not in gpu.orden  # no re-mide: informa el presupuesto de arranque
-    assert exc.value.__cause__ is original
     assert exc.value.tokens_pedido == 1256
     assert exc.value.necesaria_mb == pytest.approx(1256 * COSTO_LLAMA3_8B / MIB)
     assert exc.value.presupuesto_arranque_mb == pytest.approx(PRESUPUESTO_ARRANQUE_MB)
@@ -589,6 +595,62 @@ def test_oom_al_generar_se_convierte_en_vram_insuficiente(monkeypatch, caplog):
     assert "estimación" in mensaje and "1256" in mensaje and "314.0" in mensaje and "598.0" in mensaje
     assert "Tried to allocate" not in caplog.text and SALIDA_CALENTAMIENTO not in caplog.text
     assert not avisos[0].exc_info
+
+
+SENTINELA_TORCH = "SENTINELA-TORCH-3H"
+
+
+def provocar_oom(monkeypatch, caplog=None):
+    """
+    Un OOM del generate falso con un texto sentinela, y gc.collect falso que se registra en el
+    mismo `orden` que empty_cache. Devuelve (gpu, excepción lanzada, mensajes de log).
+    """
+    gpu = GPUFalsa(libre_b=2000 * MIB, total_b=TOTAL_B, asignada_b=ASIGNADA_B)
+    torch_falso = gpu.torch()
+    monkeypatch.setitem(sys.modules, "torch", torch_falso)
+    monkeypatch.setattr(engine, "gc", types.SimpleNamespace(collect=lambda: gpu.orden.append(("gc_collect",))))
+    original = torch_falso.cuda.OutOfMemoryError(f"CUDA out of memory. {SENTINELA_TORCH}")
+    motor = motor_cargado(gpu, prompt_tokens=1000, error_generate=original)
+    mensajes = []
+    if caplog is not None:
+        log, estado = capturar_logs(caplog)
+    try:
+        with pytest.raises(VRAMInsuficiente) as exc:
+            if caplog is not None:
+                with caplog.at_level(logging.INFO, logger="llama_local"):
+                    motor.generar([{"role": "user", "content": "x"}], 0, 256)
+            else:
+                motor.generar([{"role": "user", "content": "x"}], 0, 256)
+    finally:
+        if caplog is not None:
+            mensajes = [r.getMessage() for r in caplog.records]
+            soltar_logs(caplog, log, estado)
+    return gpu, exc.value, mensajes
+
+
+def test_tras_un_oom_empty_cache_corre_sin_ninguna_excepcion_activa(monkeypatch):
+    # Dentro del except la excepción viva retiene el traceback y los tensores del generate
+    # fallido: empty_cache ahí no libera esa VRAM (paso 3g: ~420 MiB quedaban reservados).
+    gpu, _, _ = provocar_oom(monkeypatch)
+    assert gpu.exc_info_en_empty_cache == [(None, None, None)]
+
+
+def test_tras_un_oom_gc_collect_corre_antes_de_empty_cache(monkeypatch):
+    gpu, _, _ = provocar_oom(monkeypatch)
+    nombres = [p[0] for p in gpu.orden]
+    assert nombres.count("gc_collect") == 1 and nombres.count("empty_cache") == 1
+    assert nombres.index("generate") < nombres.index("gc_collect") < nombres.index("empty_cache")
+
+
+def test_vram_insuficiente_no_encadena_la_excepcion_de_torch(monkeypatch, caplog):
+    _, exc, mensajes = provocar_oom(monkeypatch, caplog)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert SENTINELA_TORCH not in str(exc)
+    (aviso,) = [m for m in mensajes if m.startswith("OOM al generar")]
+    assert "1256" in aviso and "314.0" in aviso and "598.0" in aviso
+    assert all(SENTINELA_TORCH not in m for m in mensajes)
+    assert SENTINELA_TORCH not in caplog.text
 
 
 def test_otras_excepciones_al_generar_no_se_convierten(monkeypatch):

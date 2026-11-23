@@ -327,7 +327,8 @@ def test_vram_insuficiente_da_503_con_los_numeros_y_sin_contenido(motor, caplog)
 
 
 def test_oom_convertido_da_503_sin_texto_de_torch(motor, caplog):
-    # Lo que lanza el motor real ante un OOM: VRAMInsuficiente encadenada a la excepción de torch.
+    # El motor real ya no encadena (paso 3h), pero la app no debe filtrar el texto de torch ni si
+    # la VRAMInsuficiente llegara encadenada: se arma el peor caso a propósito.
     torch_texto = f"CUDA out of memory. Tried to allocate 64.00 MiB {SECRETO}"
     try:
         raise RuntimeError(torch_texto)
