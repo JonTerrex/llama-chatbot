@@ -240,17 +240,18 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
                 ERROR_TYPE_INVALID_REQUEST, "context_length_exceeded", "messages",
             )
         except VRAMInsuficiente as e:
-            # 503: no hay capacidad para este pedido en este momento o en esta GPU. Viene de la
-            # verificación previa o de un OOM real al generar, y puede ser permanente para ese
-            # tamaño. El 400 context_length_exceeded es un límite ESTIMADO y conservador, no una
-            # garantía. Solo números, sin traceback ni texto de torch.
+            # 503: un OOM real al generar (no hay verificación previa por pedido: la capacidad se
+            # decide al arrancar). Puede ser permanente para ese tamaño en esta GPU. El 400
+            # context_length_exceeded es un límite ESTIMADO y conservador, no una garantía.
+            # Solo números, sin traceback ni texto de torch. El engine ya emitió el WARNING.
             logger.info(
-                "VRAM insuficiente: necesaria_mib=%.1f disponible_mib=%.1f.", e.necesaria_mb, e.disponible_mb
+                "VRAM insuficiente: tokens_pedido=%d necesaria_estimada_mib=%.1f presupuesto_arranque_mib=%.1f.",
+                e.tokens_pedido, e.necesaria_mb, e.presupuesto_arranque_mb,
             )
             return error_response(
                 503,
-                f"VRAM insuficiente: el pedido necesita {e.necesaria_mb:.0f} MiB "
-                f"y hay {e.disponible_mb:.0f} MiB disponibles.",
+                f"VRAM insuficiente: el pedido de {e.tokens_pedido} tokens (estimado {e.necesaria_mb:.0f} MiB) "
+                f"no entró en la GPU; presupuesto de arranque {e.presupuesto_arranque_mb:.0f} MiB.",
                 ERROR_TYPE_PROVIDER, "insufficient_vram",
             )
         except Exception as e:

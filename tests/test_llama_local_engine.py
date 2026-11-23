@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-import src.providers.llama_local.engine as engine
 from src.providers.llama_local.engine import (
     MARGEN_VRAM_MB,
     RESERVA_PEDIDO_MB,
@@ -23,7 +22,6 @@ from src.providers.llama_local.engine import (
     presupuesto_vram_b,
     resolver_parametros,
     validar_contexto,
-    vram_alcanza,
 )
 
 GIB = 1024 ** 3
@@ -188,28 +186,6 @@ def test_fraccion_vram_sin_lugar_falla(libre_mib):
         fraccion_vram(libre_mib * MIB, 8 * GIB, 256 * MIB)
 
 
-RESERVA_B = RESERVA_PEDIDO_MB * MIB
-
-
-def test_vram_alcanza_justo_en_el_borde():
-    # necesaria = 1000 tokens * costo; disponible = libre + cache - margen - reserva, exactamente igual.
-    necesaria = 1000 * COSTO_LLAMA3_8B
-    assert vram_alcanza(1000, COSTO_LLAMA3_8B, necesaria + 256 * MIB + RESERVA_B, 0, 256 * MIB, RESERVA_B)
-
-
-def test_vram_alcanza_un_byte_por_encima_no():
-    necesaria = 1000 * COSTO_LLAMA3_8B
-    assert not vram_alcanza(1000, COSTO_LLAMA3_8B, necesaria + 256 * MIB + RESERVA_B - 1, 0, 256 * MIB, RESERVA_B)
-
-
-def test_vram_alcanza_descuenta_la_reserva():
-    # Mismo pedido y misma VRAM: alcanza sin reserva y no con la reserva de 150 MiB.
-    necesaria = 1000 * COSTO_LLAMA3_8B
-    libre = necesaria + 256 * MIB + 100 * MIB
-    assert vram_alcanza(1000, COSTO_LLAMA3_8B, libre, 0, 256 * MIB, 0)
-    assert not vram_alcanza(1000, COSTO_LLAMA3_8B, libre, 0, 256 * MIB, RESERVA_B)
-
-
 def test_presupuesto_vram_sin_cache():
     assert presupuesto_vram_b(1000 * MIB, 0, 256 * MIB, 0) == 744 * MIB
 
@@ -233,29 +209,6 @@ def test_presupuesto_vram_negativo_y_contexto_por_vram_lo_rechaza():
     assert presupuesto == -106 * MIB
     with pytest.raises(ValueError, match="no alcanza"):
         contexto_por_vram(presupuesto, COSTO_LLAMA3_8B, 8192)
-
-
-@pytest.mark.parametrize("tokens", [0, 1, 999, 1000, 1001, 4066])
-@pytest.mark.parametrize("libre_mib, cache_mib", [(0, 0), (256, 0), (300, 400), (598, 0), (1000, 250)])
-def test_vram_alcanza_equivale_a_comparar_con_el_presupuesto(tokens, libre_mib, cache_mib):
-    # Mismos números por los dos caminos: el tope de arranque y la verificación por pedido.
-    args = (libre_mib * MIB, cache_mib * MIB, 256 * MIB, RESERVA_B)
-    assert vram_alcanza(tokens, COSTO_LLAMA3_8B, *args) == (tokens * COSTO_LLAMA3_8B <= presupuesto_vram_b(*args))
-
-
-def test_vram_alcanza_delega_en_presupuesto_vram_b(monkeypatch):
-    # La equivalencia numérica no detecta una cuenta duplicada (daría lo mismo): esto sí exige
-    # que vram_alcanza use la función única, para que un cambio en ella llegue a los dos caminos.
-    monkeypatch.setattr(engine, "presupuesto_vram_b", lambda libre, cache, margen, reserva: 10 ** 15)
-    assert vram_alcanza(1000, COSTO_LLAMA3_8B, 0, 0, 256 * MIB, RESERVA_B)
-    monkeypatch.setattr(engine, "presupuesto_vram_b", lambda libre, cache, margen, reserva: -1)
-    assert not vram_alcanza(1, COSTO_LLAMA3_8B, 100 * GIB, 0, 0, 0)
-
-
-def test_vram_alcanza_gracias_a_la_cache_reutilizable():
-    necesaria = 1000 * COSTO_LLAMA3_8B
-    assert not vram_alcanza(1000, COSTO_LLAMA3_8B, 256 * MIB + RESERVA_B, 0, 256 * MIB, RESERVA_B)
-    assert vram_alcanza(1000, COSTO_LLAMA3_8B, 256 * MIB + RESERVA_B, necesaria, 256 * MIB, RESERVA_B)
 
 
 # ---------- cargar() completo, con torch y transformers falsos ----------
@@ -394,6 +347,7 @@ def test_cargar_calcula_el_tope_con_la_vram_posterior_al_calentamiento(monkeypat
     motor = MotorLlama("modelos/llama3", 0.9)
     motor.cargar()
     assert motor.contexto_max == CONTEXTO_DESPUES == 2376  # con reserva; sin ella serían 2976
+    assert motor._presupuesto_arranque_b == PRESUPUESTO_DESPUES_B  # lo informa VRAMInsuficiente
     assert motor._costo_por_token_b == COSTO_LLAMA3_8B
     assert motor._eos_ids == {128001, 128009}
 
@@ -440,9 +394,9 @@ def test_si_el_calentamiento_falla_cargar_lanza_y_no_fija_el_tope(monkeypatch):
     assert len([p for p in gpu.orden if p[0] == "set_fraction"]) == 1  # no llegó a la segunda
 
 
-def test_el_calentamiento_no_lo_rechaza_la_verificacion_de_vram(monkeypatch, caplog):
-    # Tras cargar el modelo casi no queda VRAM: un pedido real daría VRAMInsuficiente, pero el
-    # calentamiento no pasa por esa verificación. Después del generate, la VRAM vuelve a alcanzar.
+def test_el_calentamiento_sin_vram_libre_llega_a_generar_y_no_loguea_contenido(monkeypatch, caplog):
+    # Tras cargar el modelo casi no queda VRAM libre: el calentamiento igual llega a generate (no
+    # hay verificación previa). Después del generate, la VRAM vuelve a alcanzar para el tope.
     gpu = gpu_con_calentamiento(durante={"libre_b": 0, "reservada_b": ASIGNADA_B})
     gpu.instalar(monkeypatch)
     log = logging.getLogger("llama_local")
@@ -460,17 +414,6 @@ def test_el_calentamiento_no_lo_rechaza_la_verificacion_de_vram(monkeypatch, cap
     mensajes = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("Calentamiento: ") for m in mensajes)
     assert not any("Hola" in m or SALIDA_CALENTAMIENTO in m for m in mensajes)  # ni el mensaje ni lo generado
-
-
-def test_tope_de_arranque_y_verificacion_dan_el_mismo_numero(monkeypatch):
-    # Con la VRAM posterior al calentamiento, el tope es el máximo que vram_alcanza aprueba.
-    gpu = gpu_con_calentamiento()
-    gpu.instalar(monkeypatch)
-    motor = MotorLlama("modelos/llama3", 0.9)
-    motor.cargar()
-    args = (DESPUES["libre_b"], DESPUES["reservada_b"] - DESPUES["asignada_b"], MARGEN_VRAM_MB * MIB, RESERVA_B)
-    assert vram_alcanza(motor.contexto_max, COSTO_LLAMA3_8B, *args)
-    assert not vram_alcanza(motor.contexto_max + 1, COSTO_LLAMA3_8B, *args)
 
 
 def test_cargar_sin_head_dim_lo_deriva_de_hidden_size(monkeypatch):
@@ -507,14 +450,22 @@ def test_cargar_falla_si_no_queda_vram_para_contexto(monkeypatch):
     assert motor.contexto_max is None and motor._model is None
 
 
-# ---------- generar(): verificación de VRAM por pedido ----------
+# ---------- generar(): sin verificación de VRAM por pedido ----------
 
 class LlegoAGenerar(Exception):
     pass
 
 
-def motor_cargado(gpu: GPUFalsa, prompt_tokens: int, error_generate=None):
-    """MotorLlama con modelo y tokenizador falsos, sin pasar por cargar(). generate lanza `error_generate`."""
+# Presupuesto de arranque del motor armado a mano (el medido en vivo en el paso 3f).
+PRESUPUESTO_ARRANQUE_MB = 598.0
+
+
+def motor_cargado(gpu: GPUFalsa, prompt_tokens: int, error_generate=None, genera=False, contexto_max=8192):
+    """
+    MotorLlama con modelo y tokenizador falsos, sin pasar por cargar(). generate lanza
+    `error_generate`; si no hay error, con genera=True devuelve max_new_tokens tokens sin fin
+    (finish_reason "length") y si no lanza LlegoAGenerar.
+    """
     o = gpu.orden
 
     class TensorFalso:
@@ -524,41 +475,77 @@ def motor_cargado(gpu: GPUFalsa, prompt_tokens: int, error_generate=None):
             o.append(("to_gpu",))
             return self
 
-    def generate(**kwargs):
+    def generate(max_new_tokens, **kwargs):
         o.append(("generate",))
-        raise error_generate if error_generate is not None else LlegoAGenerar()
+        if error_generate is not None:
+            raise error_generate
+        if not genera:
+            raise LlegoAGenerar()
+        return [Secuencia([7] * prompt_tokens + [42] * max_new_tokens)]
 
     motor = MotorLlama("modelos/llama3", 0.9)
     motor._tokenizer = types.SimpleNamespace(
-        apply_chat_template=lambda *a, **k: {"input_ids": TensorFalso()}, pad_token_id=None, eos_token_id=128009
+        apply_chat_template=lambda *a, **k: {"input_ids": TensorFalso()}, pad_token_id=None, eos_token_id=128009,
+        decode=lambda ids, **k: SALIDA_CALENTAMIENTO,
     )
     motor._model = types.SimpleNamespace(device=types.SimpleNamespace(type="cuda"), generate=generate)
     motor._eos_ids = {128009}
     motor._costo_por_token_b = COSTO_LLAMA3_8B
-    motor.contexto_max = 8192
+    motor._presupuesto_arranque_b = PRESUPUESTO_ARRANQUE_MB * MIB
+    motor.contexto_max = contexto_max
     return motor
 
 
-def test_generar_sin_vram_suficiente_falla_antes_de_tocar_la_gpu(monkeypatch):
-    # 1000 + 256 tokens * 0,25 MiB = 314 MiB necesarios; disponibles 300 + 0 - 256 - 150 = -106 MiB.
-    gpu = GPUFalsa(libre_b=300 * MIB, total_b=TOTAL_B, asignada_b=ASIGNADA_B)
+class GPURuidosa(GPUFalsa):
+    """mem_get_info devuelve valores MUY distintos en cada llamada, como el ruido medido en el paso 3f."""
+
+    def __init__(self, libres_mib, **kw):
+        super().__init__(libre_b=libres_mib[0] * MIB, total_b=TOTAL_B, asignada_b=ASIGNADA_B, **kw)
+        self._libres = [x * MIB for x in libres_mib]
+        self._i = 0
+
+    def mem_get_info(self, device=0):
+        self.libre_b = self._libres[self._i % len(self._libres)]
+        self._i += 1
+        return super().mem_get_info(device)
+
+
+def test_pedido_justo_en_el_tope_se_acepta_siempre_aunque_la_vram_libre_oscile(monkeypatch):
+    # El bug del paso 3f: 2390 tokens contra un tope de 2391 dieron 503 en 5 de 9 pedidos idénticos
+    # porque la verificación por pedido re-medía mem_get_info (375-598 MiB). Ahora la capacidad la
+    # decide el tope de arranque: con la VRAM libre oscilando entre 100, 900 y 400 MiB, el pedido
+    # exactamente en el tope llega a generar en TODAS las repeticiones.
+    gpu = GPURuidosa([100, 900, 400])
     gpu.instalar(monkeypatch)
-    motor = motor_cargado(gpu, prompt_tokens=1000)
-    with pytest.raises(VRAMInsuficiente) as exc:
-        motor.generar([{"role": "user", "content": "x"}], 0, 256)
-    assert exc.value.necesaria_mb == pytest.approx(1256 * COSTO_LLAMA3_8B / MIB)
-    assert exc.value.disponible_mb == pytest.approx(300 - MARGEN_VRAM_MB - RESERVA_PEDIDO_MB)
-    assert ("generate",) not in gpu.orden and ("to_gpu",) not in gpu.orden
+    tope = 2391
+    motor = motor_cargado(gpu, prompt_tokens=tope - 256, genera=True, contexto_max=tope)
+    resultados = [motor.generar([{"role": "user", "content": "x"}], 0, 256) for _ in range(9)]
+    assert [r.completion_tokens for r in resultados] == [256] * 9
+    assert all(r.prompt_tokens + 256 == tope and r.finish_reason == "length" for r in resultados)
 
 
-def test_generar_con_vram_suficiente_sigue_hasta_generate(monkeypatch):
-    # La cache reservada y libre del proceso cuenta: 300 libres + 500 de cache - 406 = 394 >= 314 MiB.
-    gpu = GPUFalsa(libre_b=300 * MIB, total_b=TOTAL_B, asignada_b=ASIGNADA_B, reservada_b=ASIGNADA_B + 500 * MIB)
+def test_durante_un_pedido_no_se_llama_a_mem_get_info(monkeypatch):
+    # cargar() mide la VRAM (antes de cargar y tras el calentamiento); los pedidos, nunca.
+    gpu = gpu_con_calentamiento()
+    gpu.instalar(monkeypatch)
+    motor = MotorLlama("modelos/llama3", 0.9)
+    motor.cargar()
+    llamadas_carga = [p for p in gpu.orden if p[0] == "mem_get_info"]
+    assert len(llamadas_carga) == 2, gpu.orden
+    for _ in range(3):
+        motor.generar([{"role": "user", "content": "x"}], 0, 16)
+    assert [p for p in gpu.orden if p[0] == "mem_get_info"] == llamadas_carga
+    assert [p[0] for p in gpu.orden].count("generate") == 4  # calentamiento + 3 pedidos
+
+
+def test_generar_sin_vram_libre_igual_llega_a_generate(monkeypatch):
+    # Antes, 300 MiB libres rechazaban este pedido de 314 MiB antes de tocar la GPU; ahora decide el tope.
+    gpu = GPUFalsa(libre_b=300 * MIB, total_b=TOTAL_B, asignada_b=ASIGNADA_B)
     gpu.instalar(monkeypatch)
     motor = motor_cargado(gpu, prompt_tokens=1000)
     with pytest.raises(LlegoAGenerar):
         motor.generar([{"role": "user", "content": "x"}], 0, 256)
-    assert [p[0] for p in gpu.orden if p[0] != "mem_get_info"] == ["to_gpu", "generate"]
+    assert [p[0] for p in gpu.orden] == ["to_gpu", "generate"]
 
 
 def capturar_logs(caplog):
@@ -590,14 +577,16 @@ def test_oom_al_generar_se_convierte_en_vram_insuficiente(monkeypatch, caplog):
     finally:
         soltar_logs(caplog, log, estado)
     assert ("empty_cache",) in gpu.orden
+    assert ("mem_get_info", gpu.libre_b) not in gpu.orden  # no re-mide: informa el presupuesto de arranque
     assert exc.value.__cause__ is original
+    assert exc.value.tokens_pedido == 1256
     assert exc.value.necesaria_mb == pytest.approx(1256 * COSTO_LLAMA3_8B / MIB)
-    assert exc.value.disponible_mb == pytest.approx(2000 + 100 - MARGEN_VRAM_MB - RESERVA_PEDIDO_MB)
+    assert exc.value.presupuesto_arranque_mb == pytest.approx(PRESUPUESTO_ARRANQUE_MB)
     assert "Tried to allocate" not in str(exc.value) and SALIDA_CALENTAMIENTO not in str(exc.value)
     avisos = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(avisos) == 1
     mensaje = avisos[0].getMessage()
-    assert "estimación" in mensaje and "1256" in mensaje and "314.0" in mensaje
+    assert "estimación" in mensaje and "1256" in mensaje and "314.0" in mensaje and "598.0" in mensaje
     assert "Tried to allocate" not in caplog.text and SALIDA_CALENTAMIENTO not in caplog.text
     assert not avisos[0].exc_info
 
@@ -612,7 +601,11 @@ def test_otras_excepciones_al_generar_no_se_convierten(monkeypatch):
 
 
 def test_vram_insuficiente_solo_lleva_numeros():
-    assert str(VRAMInsuficiente(314.0, 44.0)) == "necesaria_mb=314.0, disponible_mb=44.0"
+    assert str(VRAMInsuficiente(1256, 314.0, 598.0)) == (
+        "tokens_pedido=1256, necesaria_mb=314.0, presupuesto_arranque_mb=598.0"
+    )
+    # OOM en el calentamiento: todavía no hay presupuesto de arranque.
+    assert str(VRAMInsuficiente(13, 3.25, None)).endswith("presupuesto_arranque_mb=None")
 
 
 # ---------- liberar(): logs de diagnóstico del apagado ----------

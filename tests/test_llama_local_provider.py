@@ -305,13 +305,16 @@ def test_contexto_excedido_da_400_sin_contenido(motor):
 
 
 def test_vram_insuficiente_da_503_con_los_numeros_y_sin_contenido(motor, caplog):
-    motor.error_generar = VRAMInsuficiente(3140.5, 1200.0)
+    motor.error_generar = VRAMInsuficiente(12562, 3140.5, 1200.0)
     with caplog.at_level(logging.INFO):
         with cliente() as c:
             r = pedir(c, messages=[{"role": "user", "content": SECRETO}])
     error = assert_error(r, 503, "insufficient_vram", None, "provider_error")
     # Solo los números: nada que prometa que es transitorio (bajo WSL2 puede no serlo).
-    assert error["message"] == "VRAM insuficiente: el pedido necesita 3140 MiB y hay 1200 MiB disponibles."
+    assert error["message"] == (
+        "VRAM insuficiente: el pedido de 12562 tokens (estimado 3140 MiB) no entró en la GPU; "
+        "presupuesto de arranque 1200 MiB."
+    )
     assert "transitori" not in error["message"].lower() and "momento" not in error["message"].lower()
     assert "x_provider" not in error
     assert SECRETO not in r.text
@@ -329,14 +332,17 @@ def test_oom_convertido_da_503_sin_texto_de_torch(motor, caplog):
     try:
         raise RuntimeError(torch_texto)
     except RuntimeError as original:
-        convertida = VRAMInsuficiente(564.0, 380.5)
+        convertida = VRAMInsuficiente(2256, 564.0, 380.5)
         convertida.__cause__ = original
     motor.error_generar = convertida
     with caplog.at_level(logging.INFO):
         with cliente() as c:
             r = pedir(c, messages=[{"role": "user", "content": SECRETO}])
     error = assert_error(r, 503, "insufficient_vram", None, "provider_error")
-    assert error["message"] == "VRAM insuficiente: el pedido necesita 564 MiB y hay 380 MiB disponibles."
+    assert error["message"] == (
+        "VRAM insuficiente: el pedido de 2256 tokens (estimado 564 MiB) no entró en la GPU; "
+        "presupuesto de arranque 380 MiB."
+    )
     for texto in (SECRETO, "Tried to allocate", "CUDA out of memory"):
         assert texto not in r.text
         assert texto not in caplog.text
