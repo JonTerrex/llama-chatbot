@@ -24,6 +24,7 @@ from src.orchestrator.config import USER_ID_PATTERN as MEMORY_ID_PATTERN
 from src.orchestrator.config import Config, cargar_config
 from src.orchestrator.logging_config import configurar_logging
 from src.orchestrator.memory_client import MemoryClient, MemoryUnavailable, crear_cliente_memoria
+from src.orchestrator.presupuesto import disponible_para_mensajes, recortar_historial, tokens_de_mensajes
 
 logger = logging.getLogger("orchestrator")
 
@@ -292,6 +293,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # Solo role y content: created_at es de la memoria, no del contrato con proveedores.
         historial = [{"role": m.role, "content": m.content} for m in guardados]
 
+    # 2d. Presupuesto de tokens: solo con memoria y si el proveedor declara context_tokens.
+    #     Sin memoria el cliente arma su messages y se reenvía entero, como hoy.
+    tope = config.context_tokens.get(modelo)
+    if usa_memoria and tope is not None:
+        recortado = ajustar_historial_al_contexto(historial, req, modelo, tope, config.system_prompt)
+        if recortado is None:
+            # Sale antes de llamar al proveedor y de guardar nada.
+            return error_response(
+                400,
+                f"La petición no entra en el contexto del modelo '{modelo}' aunque se descarte todo el historial.",
+                ERROR_TYPE_INVALID_REQUEST, "context_length_exceeded", "messages",
+            )
+        historial = recortado
+
     # 3. Los extras se descartan en silencio para el cliente, pero quedan en el log para diagnosticar.
     if req.model_extra:
         logger.warning("Campos no soportados descartados: %r", sorted(req.model_extra))
@@ -353,6 +368,33 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     data["x_memory"] = {"status": await guardar_turno_en_memoria(memory_client, conversation_id, req, data)}
     return JSONResponse(status_code=resp.status_code, content=data)
+
+
+def ajustar_historial_al_contexto(
+    historial: list[dict[str, str]], req: ChatCompletionRequest, modelo: str, tope: int, system_prompt: str
+) -> Optional[list[dict[str, str]]]:
+    """
+    El historial recortado para que [system] + historial + mensaje nuevo entre en `tope`
+    (estimación de presupuesto.py), o None si ni system + mensaje nuevo entran.
+    Logs: solo números, nunca contenido.
+    """
+    fijos = [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in req.messages]
+    disponible = disponible_para_mensajes(tope, req.max_tokens)
+    recortado = recortar_historial(fijos, historial, disponible)
+    if recortado is None:
+        logger.warning(
+            "Pedido que no entra sin historial: modelo=%s tokens_estimados=%d disponible=%d tope=%d.",
+            modelo, tokens_de_mensajes(fijos), disponible, tope,
+        )
+        return None
+    if len(recortado) < len(historial):
+        logger.info(
+            "Historial recortado: modelo=%s descartados=%d tokens_estimados_antes=%d "
+            "tokens_estimados_despues=%d disponible=%d tope=%d.",
+            modelo, len(historial) - len(recortado),
+            tokens_de_mensajes(fijos + historial), tokens_de_mensajes(fijos + recortado), disponible, tope,
+        )
+    return recortado
 
 
 def contenido_del_asistente(data: dict[str, Any]) -> Optional[str]:

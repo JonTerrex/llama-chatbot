@@ -1,7 +1,7 @@
 """Verifica la carga y validación de la configuración del orquestador."""
 import pytest
 
-from src.orchestrator.config import cargar_config
+from src.orchestrator.config import Config, cargar_config
 
 
 @pytest.fixture
@@ -205,4 +205,54 @@ def test_history_limit_invalido(entorno, monkeypatch, valor, mensaje):
 def test_memory_timeout_invalido(entorno, monkeypatch, valor, mensaje):
     monkeypatch.setenv("MEMORY_TIMEOUT_S", valor)
     with pytest.raises(ValueError, match=f"MEMORY_TIMEOUT_S='{valor}' .*{mensaje}"):
+        cargar_config()
+
+
+# ---------- context_tokens (presupuesto de tokens del historial) ----------
+
+def registro_con_tope(valor_yaml):
+    return (
+        "providers:\n"
+        "  mock:\n"
+        "    url: http://mock:8000\n"
+        "  local:\n"
+        "    url: http://local:9000\n"
+        f"    context_tokens: {valor_yaml}\n"
+    )
+
+
+def test_context_tokens_valido(entorno):
+    escribir_registro(entorno, registro_con_tope("1800"))
+    config = cargar_config()
+    assert config.context_tokens == {"local": 1800}
+    assert type(config.context_tokens["local"]) is int
+    # El tipo de providers no cambia: sigue siendo nombre -> URL.
+    assert config.providers == {"mock": "http://mock:8000", "local": "http://local:9000"}
+
+
+def test_context_tokens_minimo_es_1(entorno):
+    escribir_registro(entorno, registro_con_tope("1"))
+    assert cargar_config().context_tokens == {"local": 1}
+
+
+def test_sin_context_tokens_el_dict_no_tiene_la_clave(entorno):
+    config = cargar_config()
+    assert config.context_tokens == {}
+    assert "mock" not in config.context_tokens
+
+
+def test_config_construida_a_mano_tiene_context_tokens_vacio():
+    # default_factory: construcciones existentes de Config (sin el campo) siguen valiendo.
+    config = Config(providers={"m": "http://m"}, default_model=None, timeout_s=1.0, system_prompt="s")
+    assert config.context_tokens == {}
+
+
+@pytest.mark.parametrize(
+    "valor_yaml",
+    ["0", "-5", "abc", "1.5", "true", "[1800]", "'1800'", "null"],
+    ids=["cero", "negativo", "texto", "float", "bool", "lista", "numero_entre_comillas", "null"],
+)
+def test_context_tokens_invalido(entorno, valor_yaml):
+    escribir_registro(entorno, registro_con_tope(valor_yaml))
+    with pytest.raises(ValueError, match="'context_tokens' del proveedor 'local' debe ser un entero >= 1"):
         cargar_config()

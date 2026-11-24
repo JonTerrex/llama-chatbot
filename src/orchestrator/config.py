@@ -7,7 +7,7 @@ a que arranque con un registro de proveedores inválido y falle en cada petició
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +36,9 @@ class Config:
     # Debe ser MAYOR que POOL_TIMEOUT_S de src/memory/db.py (hoy 4 s): así, con la base
     # caída, la memoria alcanza a contestar su 503. No se puede validar entre servicios.
     memory_timeout_s: float = 5.0
+    # nombre de modelo -> tope de contexto (prompt + max_tokens) que declara providers.yaml.
+    # Un modelo sin entrada no tiene tope conocido: su historial de memoria no se recorta.
+    context_tokens: dict[str, int] = field(default_factory=dict)
 
 
 def _leer_archivo(ruta: Path, descripcion: str) -> str:
@@ -44,8 +47,11 @@ def _leer_archivo(ruta: Path, descripcion: str) -> str:
     return ruta.read_text(encoding="utf-8-sig")
 
 
-def _cargar_providers(ruta: Path) -> dict[str, str]:
-    """Valida la forma del registro y normaliza las URLs (sin barra final, para concatenar rutas sin '//')."""
+def _cargar_providers(ruta: Path) -> tuple[dict[str, str], dict[str, int]]:
+    """
+    Valida la forma del registro y normaliza las URLs (sin barra final, para concatenar rutas sin '//').
+    Devuelve también los `context_tokens` opcionales, solo de los proveedores que los declaran.
+    """
     try:
         datos = yaml.safe_load(_leer_archivo(ruta, "registro de proveedores"))
     except yaml.YAMLError as e:
@@ -59,6 +65,7 @@ def _cargar_providers(ruta: Path) -> dict[str, str]:
         raise ValueError(f"'{ruta}': 'providers' está vacío o no es un mapa nombre -> {{url}}.")
 
     providers: dict[str, str] = {}
+    context_tokens: dict[str, int] = {}
     for nombre, entrada in entradas.items():
         url = entrada.get("url") if isinstance(entrada, dict) else None
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
@@ -66,7 +73,16 @@ def _cargar_providers(ruta: Path) -> dict[str, str]:
                 f"'{ruta}': el proveedor '{nombre}' necesita 'url' que empiece con http:// o https://."
             )
         providers[str(nombre)] = url.rstrip("/")
-    return providers
+        if "context_tokens" in entrada:
+            tope = entrada["context_tokens"]
+            # bool es subclase de int en Python: sin excluirlo, "true" valdría 1.
+            if not isinstance(tope, int) or isinstance(tope, bool) or tope < 1:
+                raise ValueError(
+                    f"'{ruta}': 'context_tokens' del proveedor '{nombre}' debe ser un entero >= 1 "
+                    f"(se leyó {tope!r})."
+                )
+            context_tokens[str(nombre)] = tope
+    return providers, context_tokens
 
 
 def cargar_config() -> Config:
@@ -74,7 +90,7 @@ def cargar_config() -> Config:
     providers_file = Path(os.getenv("PROVIDERS_FILE", "providers.yaml"))
     prompt_file = Path(os.getenv("SYSTEM_PROMPT_FILE", "prompts/system_prompt.txt"))
 
-    providers = _cargar_providers(providers_file)
+    providers, context_tokens = _cargar_providers(providers_file)
 
     # Vacío cuenta como ausente: en compose es común dejar "DEFAULT_MODEL=" sin valor.
     default_model = os.getenv("DEFAULT_MODEL") or None
@@ -105,6 +121,7 @@ def cargar_config() -> Config:
         dev_user_id=dev_user_id,
         memory_history_limit=memory_history_limit,
         memory_timeout_s=memory_timeout_s,
+        context_tokens=context_tokens,
     )
 
 

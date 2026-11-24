@@ -840,3 +840,164 @@ def test_ningun_log_contiene_urls_internas_con_root_en_info(memoria_habilitada, 
         texto = f"{rec.name} {rec.getMessage()} {rec.args!r}"
         for secreto in (HOST_MEMORIA, f"http://{HOST_MEMORIA}:8000", HOST_PROVEEDOR, f"http://{HOST_PROVEEDOR}:9000"):
             assert secreto not in texto, f"{rec.name} filtró una URL interna"
+
+
+# ---------- Presupuesto de tokens del historial (context_tokens) ----------
+# Cuentas a mano con el estimador (ceil(len/3) + 8 por mensaje, OVERHEAD_BASE = 16):
+#   system de prueba (31 caracteres) = 19; cada mensaje de 30 caracteres = 18.
+#   fijos (system + nuevo) = 37; historial de 6 mensajes = 108; total = 145.
+#   Con max_tokens = 100: disponible = tope - 100 - 16 = tope - 116.
+
+SENTINELA_HISTORIAL = "SENT-HIST-91"
+
+
+def texto30(etiqueta):
+    texto = f"{etiqueta}-{SENTINELA_HISTORIAL}".ljust(30, ".")
+    assert len(texto) == 30
+    return texto
+
+
+HIST_LARGO = [
+    {"role": rol, "content": texto30(f"m{i}"), "created_at": 1794305700 + i}
+    for i, rol in enumerate(["user", "assistant"] * 3)
+]
+HIST_LARGO_PROYECTADO = [{"role": m["role"], "content": m["content"]} for m in HIST_LARGO]
+NUEVO = {"role": "user", "content": texto30("nuevo")}
+
+
+def escribir_registro_con_tope(tmp_path, tope, modelo="mock"):
+    """Reescribe el registro del fixture proveedor (mismo tmp_path) con context_tokens en `modelo`."""
+    lineas = ["providers:"]
+    for nombre, url in (("mock", f"http://{HOST_PROVEEDOR}:9000"), ("local", "http://otro.internal:9001")):
+        lineas += [f"  {nombre}:", f"    url: {url}"]
+        if nombre == modelo:
+            lineas.append(f"    context_tokens: {tope}")
+    (tmp_path / "providers.yaml").write_text("\n".join(lineas) + "\n", encoding="utf-8")
+
+
+def memoria_con_historial(memoria, historial):
+    memoria.responder = lambda r: (
+        httpx2.Response(200, json={"conversation_id": CONV, "messages": historial}) if r.method == "GET"
+        else httpx2.Response(201, json={"conversation_id": CONV, "stored": 2})
+    )
+
+
+def registros_de_recorte(caplog):
+    return [rec for rec in caplog.records if rec.name == "orchestrator" and "Historial recortado" in rec.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "tope, esperado",
+    [
+        (261, HIST_LARGO_PROYECTADO),       # disponible 145: entra justo, completo
+        (225, HIST_LARGO_PROYECTADO[2:]),   # disponible 109: hay que sacar el primer par entero
+        (260, HIST_LARGO_PROYECTADO[2:]),   # disponible 144: alcanza con sacar m0; m1 (assistant) queda partido
+        (189, HIST_LARGO_PROYECTADO[4:]),   # disponible 73: sacar 4
+        (153, []),                          # disponible 37: solo system + nuevo
+    ],
+    ids=["entra_completo", "descarta_un_par", "par_partido", "descarta_dos_pares", "sin_historial"],
+)
+def test_recorte_del_historial_por_tokens(memoria_habilitada, memoria, tmp_path, tope, esperado):
+    escribir_registro_con_tope(tmp_path, tope)
+    memoria_con_historial(memoria, HIST_LARGO)
+    with TestClient(app) as client:
+        r = pedir(client, x_conversation_id=CONV, messages=[NUEVO], max_tokens=100)
+
+    assert r.status_code == 200
+    assert r.json()["x_memory"] == {"status": "saved"}
+    # El proveedor recibe exactamente system + lo que quedó (en orden, sin editar) + el nuevo.
+    (enviado,) = memoria_habilitada.recibidos
+    assert enviado["messages"] == system_mas(*esperado, NUEVO)
+    assert "x_conversation_id" not in enviado
+    assert enviado["max_tokens"] == 100
+    if esperado:
+        assert esperado[0]["role"] == "user"
+    # Se guarda solo el turno nuevo, igual que sin recorte.
+    (post,) = posts_a_memoria(memoria)
+    assert json.loads(post.content)["messages"] == [NUEVO, {"role": "assistant", "content": "Hola!"}]
+
+
+def test_sin_max_tokens_el_presupuesto_usa_el_default_del_proveedor(memoria_habilitada, memoria, tmp_path):
+    # disponible = tope - 256 - 16. Con 417 entra justo (145); con 416 se descarta el primer par.
+    memoria_con_historial(memoria, HIST_LARGO)
+    for tope, esperado in ((417, HIST_LARGO_PROYECTADO), (416, HIST_LARGO_PROYECTADO[2:])):
+        escribir_registro_con_tope(tmp_path, tope)
+        memoria_habilitada.recibidos.clear()
+        with TestClient(app) as client:
+            r = pedir(client, x_conversation_id=CONV, messages=[NUEVO])
+        assert r.status_code == 200
+        (enviado,) = memoria_habilitada.recibidos
+        assert enviado["messages"] == system_mas(*esperado, NUEVO)
+        assert "max_tokens" not in enviado  # el orquestador no inventa el parámetro
+
+
+def test_proveedor_sin_context_tokens_no_recorta(memoria_habilitada, memoria, tmp_path):
+    # Tope chico en "local", pero el pedido va a "mock", que no declara context_tokens.
+    escribir_registro_con_tope(tmp_path, 1, modelo="local")
+    memoria_con_historial(memoria, HIST_LARGO)
+    with TestClient(app) as client:
+        r = pedir(client, x_conversation_id=CONV, messages=[NUEVO], max_tokens=100000)
+    assert r.status_code == 200
+    (enviado,) = memoria_habilitada.recibidos
+    assert enviado["messages"] == system_mas(*HIST_LARGO_PROYECTADO, NUEVO)
+
+
+def test_sin_memoria_no_recorta_aunque_haya_tope(memoria_habilitada, memoria, tmp_path):
+    # El cliente manda su propio historial: se reenvía entero aunque supere el tope.
+    escribir_registro_con_tope(tmp_path, 153)
+    mensajes = HIST_LARGO_PROYECTADO + [NUEVO]
+    with TestClient(app) as client:
+        r = pedir(client, messages=mensajes, max_tokens=100)
+    assert r.status_code == 200
+    (enviado,) = memoria_habilitada.recibidos
+    assert enviado["messages"] == system_mas(*mensajes)
+    assert memoria.recibidos == []
+
+
+@pytest.mark.parametrize(
+    "tope, max_tokens", [(152, 100), (1800, 2000)], ids=["disponible_36_de_37", "max_tokens_mayor_que_el_tope"]
+)
+def test_si_system_y_nuevo_no_entran_da_400_sin_llamar_al_proveedor(
+    memoria_habilitada, memoria, tmp_path, caplog, tope, max_tokens
+):
+    escribir_registro_con_tope(tmp_path, tope)
+    memoria_con_historial(memoria, HIST_LARGO)
+    with caplog.at_level(logging.INFO):
+        with TestClient(app) as client:
+            r = pedir(client, x_conversation_id=CONV, messages=[NUEVO], max_tokens=max_tokens)
+
+    error = assert_error(r, 400, "context_length_exceeded", "messages")
+    assert set(r.json()) == {"error"}  # sin x_memory
+    assert "aunque se descarte todo el historial" in error["message"]
+    assert SENTINELA_HISTORIAL not in error["message"]
+    assert memoria_habilitada.recibidos == []  # ningún POST al proveedor
+    assert posts_a_memoria(memoria) == []      # nada guardado
+    assert [m.method for m in memoria.recibidos] == ["GET"]
+    assert registros_de_recorte(caplog) == []
+    for texto in textos_de_log(caplog):
+        assert SENTINELA_HISTORIAL not in texto
+
+
+def test_el_recorte_loguea_solo_numeros(memoria_habilitada, memoria, tmp_path, caplog):
+    escribir_registro_con_tope(tmp_path, 225)
+    memoria_con_historial(memoria, HIST_LARGO)
+    with caplog.at_level(logging.INFO):
+        with TestClient(app) as client:
+            r = pedir(client, x_conversation_id=CONV, messages=[NUEVO], max_tokens=100)
+    assert r.status_code == 200
+
+    (rec,) = registros_de_recorte(caplog)
+    assert rec.levelno == logging.INFO
+    assert rec.args == ("mock", 2, 145, 109, 109, 225)  # modelo, descartados, antes, después, disponible, tope
+    # Los mensajes descartados (y los que quedaron) llevan el sentinela: ningún registro lo trae.
+    for texto in textos_de_log(caplog):
+        assert SENTINELA_HISTORIAL not in texto
+
+
+def test_sin_descartes_no_hay_log_de_recorte(memoria_habilitada, memoria, tmp_path, caplog):
+    escribir_registro_con_tope(tmp_path, 261)
+    memoria_con_historial(memoria, HIST_LARGO)
+    with caplog.at_level(logging.INFO):
+        with TestClient(app) as client:
+            assert pedir(client, x_conversation_id=CONV, messages=[NUEVO], max_tokens=100).status_code == 200
+    assert registros_de_recorte(caplog) == []
