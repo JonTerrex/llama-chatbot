@@ -77,6 +77,8 @@ services:
       # Debe ser MAYOR que POOL_TIMEOUT_S de la memoria (4 s): con 1 s de margen, la memoria
       # alcanza a contestar su 503 antes del corte (contrato de memoria, 3.5)
       - MEMORY_TIMEOUT_S=5
+      # Nivel del logger "orchestrator" (DEBUG a CRITICAL); httpx2/httpcore2 quedan siempre en WARNING
+      - LOG_LEVEL=INFO
     # En dev se levanta el stack completo en orden: el orquestador arranca con la memoria lista.
     depends_on:
       memory:
