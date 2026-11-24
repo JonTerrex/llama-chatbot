@@ -234,6 +234,91 @@ def test_fallos_del_proveedor(proveedor, responder, status, code):
     assert "http://" not in error["message"]
 
 
+# ---------- Errores del proveedor que se propagan ----------
+
+# Texto del proveedor que no debe llegar al cliente ni al log, venga en el campo que venga.
+SENTINELA_PROVEEDOR = "SENTINELA-DEL-PROVEEDOR-77"
+
+
+def error_del_proveedor(status, code, type_="provider_error"):
+    """Responder con un error en el formato del proveedor, con el sentinela en todos los textos libres."""
+    def responder(request):
+        return httpx2.Response(status, json={"error": {
+            "message": f"detalle interno {SENTINELA_PROVEEDOR}", "type": type_, "param": "messages",
+            "code": code, "x_provider": {"name": "mock", "state": f"loading {SENTINELA_PROVEEDOR}"},
+        }})
+    return responder
+
+
+def textos_de_log(caplog):
+    return [f"{rec.getMessage()} {rec.args!r}" for rec in caplog.records]
+
+
+@pytest.mark.parametrize(
+    "status_prov, code_prov, status, code, type_, param",
+    [
+        (400, "context_length_exceeded", 400, "context_length_exceeded", "invalid_request_error", "messages"),
+        (503, "insufficient_vram", 503, "insufficient_vram", "provider_error", None),
+        (503, "provider_unavailable", 503, "provider_unavailable", "provider_error", None),
+        (500, "inference_error", 502, "provider_error", "provider_error", None),
+        # Cualquier otro no-2xx, aunque el code sea conocido: 502 genérico.
+        (501, "streaming_not_supported", 502, "provider_error", "provider_error", None),
+        (503, "context_length_exceeded", 502, "provider_error", "provider_error", None),
+        (400, "insufficient_vram", 502, "provider_error", "provider_error", None),
+        (429, None, 502, "provider_error", "provider_error", None),
+        # Code fuera de la lista blanca.
+        (400, "codigo_inventado_xyz", 502, "provider_error", "provider_error", None),
+        (503, "codigo_inventado_xyz", 502, "provider_error", "provider_error", None),
+    ],
+    ids=["400_contexto", "503_vram", "503_no_disponible", "500_inferencia", "501_otro", "503_code_de_400",
+         "400_code_de_503", "429_sin_code", "400_code_desconocido", "503_code_desconocido"],
+)
+def test_errores_del_proveedor_se_traducen(proveedor, caplog, status_prov, code_prov, status, code, type_, param):
+    proveedor.responder = error_del_proveedor(status_prov, code_prov)
+    with caplog.at_level(logging.DEBUG):
+        with TestClient(app) as client:
+            r = client.post(URL, json={"model": "mock", "messages": MENSAJES})
+
+    error = assert_error(r, status, code, param, type_)
+    # x_provider solo con el nombre: el state del proveedor (texto libre) no se copia.
+    assert error["x_provider"] == {"name": "mock"}
+    assert set(error) == {"message", "type", "param", "code", "x_provider"}
+    assert SENTINELA_PROVEEDOR not in r.text
+    assert HOST_PROVEEDOR not in r.text
+    assert all(SENTINELA_PROVEEDOR not in t for t in textos_de_log(caplog))
+    # Un code desconocido tampoco se loguea: es texto que manda el proveedor.
+    assert all("codigo_inventado_xyz" not in t for t in textos_de_log(caplog))
+    if status_prov == 500:
+        assert "inference_error" in error["message"]  # el code va en el mensaje, armado acá
+    # Una sola línea WARNING del orquestador, con el modelo y el status del proveedor.
+    (aviso,) = [rec for rec in caplog.records if rec.name == "orchestrator" and rec.levelno == logging.WARNING]
+    assert "mock" in aviso.getMessage() and str(status_prov) in aviso.getMessage()
+
+
+@pytest.mark.parametrize(
+    "cuerpo",
+    [
+        f"<html>{SENTINELA_PROVEEDOR}</html>",
+        json.dumps({"error": {"message": SENTINELA_PROVEEDOR}}),  # JSON sin code
+        json.dumps({"error": f"insufficient_vram {SENTINELA_PROVEEDOR}"}),  # error no es objeto
+        json.dumps(["insufficient_vram"]),  # el cuerpo no es objeto
+        json.dumps({"error": {"code": ["insufficient_vram"]}}),  # code no es str
+    ],
+    ids=["no_json", "sin_code", "error_no_objeto", "cuerpo_lista", "code_no_str"],
+)
+def test_error_del_proveedor_sin_code_valido_da_502_generico(proveedor, caplog, cuerpo):
+    proveedor.responder = lambda request: httpx2.Response(
+        503, content=cuerpo.encode(), headers={"content-type": "application/json"}
+    )
+    with caplog.at_level(logging.DEBUG):
+        with TestClient(app) as client:
+            r = client.post(URL, json={"model": "mock", "messages": MENSAJES})
+
+    error = assert_error(r, 502, "provider_error", None, "provider_error")
+    assert SENTINELA_PROVEEDOR not in r.text
+    assert all(SENTINELA_PROVEEDOR not in t for t in textos_de_log(caplog))
+
+
 # ---------- Endpoints auxiliares ----------
 
 def test_models_en_orden_del_registro(proveedor):
@@ -581,6 +666,24 @@ def test_proveedor_falla_no_se_guarda_nada(memoria_habilitada, memoria, responde
     assert body["error"]["x_provider"] == {"name": "mock"}
     assert posts_a_memoria(memoria) == []
     assert [r.method for r in memoria.recibidos] == ["GET"]  # sí se leyó el historial antes
+
+
+@pytest.mark.parametrize(
+    "status_prov, code, status",
+    [(400, "context_length_exceeded", 400), (503, "insufficient_vram", 503), (503, "provider_unavailable", 503)],
+    ids=["400_contexto", "503_vram", "503_no_disponible"],
+)
+def test_error_propagado_del_proveedor_no_guarda_el_turno(memoria_habilitada, memoria, status_prov, code, status):
+    memoria_habilitada.responder = error_del_proveedor(status_prov, code)
+    with TestClient(app) as client:
+        r = pedir(client, x_conversation_id=CONV)
+
+    assert r.status_code == status
+    body = r.json()
+    assert set(body) == {"error"}  # sin x_memory
+    assert body["error"]["code"] == code
+    assert posts_a_memoria(memoria) == []  # memoria 4.2 paso 4: ni el mensaje del usuario
+    assert [m.method for m in memoria.recibidos] == ["GET"]
 
 
 def test_guardado_fallido_da_200_con_write_failed(memoria_habilitada, memoria, caplog):

@@ -146,6 +146,54 @@ def error_proveedor(status_code: int, code: str, modelo: str, causa: str) -> JSO
     )
 
 
+# Lista blanca de codes del proveedor que se reconocen (llama-local: src/providers/llama_local/app.py).
+# Un code fuera de esta lista, o con otro status, cae en el 502 genérico. streaming_not_supported
+# no está: el orquestador nunca le pide stream al proveedor.
+CODES_DEL_PROVEEDOR = frozenset({"context_length_exceeded", "insufficient_vram", "provider_unavailable", "inference_error"})
+
+
+def code_del_proveedor(resp: httpx2.Response) -> Optional[str]:
+    """
+    El `error.code` del cuerpo, solo si está en la lista blanca; si no, None. Es lo ÚNICO que se
+    lee del cuerpo de error: el resto (message incluido) puede traer texto del proveedor y nunca
+    llega al cliente ni al log.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and code in CODES_DEL_PROVEEDOR else None
+
+
+def error_desde_el_proveedor(resp: httpx2.Response, modelo: str) -> JSONResponse:
+    """
+    Traduce un no-2xx del proveedor. Se propagan solo los pares (status, code) conocidos, con un
+    mensaje armado acá; el resto es el 502 provider_error de siempre. Log: modelo, status y code.
+    """
+    status, code = resp.status_code, code_del_proveedor(resp)
+    x_provider = {"x_provider": {"name": modelo}}
+    if status == 400 and code == "context_length_exceeded":
+        logger.warning("Proveedor '%s' rechazó el pedido: status=%d code=%s.", modelo, status, code)
+        return error_response(
+            400,
+            f"La petición (system, historial y mensaje nuevo) no entra en el contexto del modelo '{modelo}'.",
+            ERROR_TYPE_INVALID_REQUEST, code, "messages", extra=x_provider,
+        )
+    if status == 503 and code in ("insufficient_vram", "provider_unavailable"):
+        logger.warning("Proveedor '%s' no disponible: status=%d code=%s.", modelo, status, code)
+        mensaje = (
+            f"El proveedor '{modelo}' no tiene VRAM suficiente para este pedido."
+            if code == "insufficient_vram"
+            else f"El proveedor '{modelo}' no está disponible."
+        )
+        return error_response(503, mensaje, ERROR_TYPE_PROVIDER, code, extra=x_provider)
+    if status == 500 and code == "inference_error":
+        return error_proveedor(502, "provider_error", modelo, f"respondió HTTP {status} ({code})")
+    return error_proveedor(502, "provider_error", modelo, f"respondió HTTP {status}")
+
+
 # ---------- Endpoints ----------
 
 @app.get("/health")
@@ -278,9 +326,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     except httpx2.TransportError as e:
         return error_proveedor(502, "provider_error", modelo, f"error de transporte ({type(e).__name__})")
 
-    # 6 y 7. Pass-through solo si es 2xx con JSON; cualquier otra cosa es un fallo del proveedor.
+    # 6 y 7. Pass-through solo si es 2xx con JSON. Un no-2xx se traduce (400/503 conocidos se
+    #    propagan, el resto es 502) y, con memoria, sale acá sin guardar nada (memoria 4.2 paso 4).
     if not resp.is_success:
-        return error_proveedor(502, "provider_error", modelo, f"respondió HTTP {resp.status_code}")
+        return error_desde_el_proveedor(resp, modelo)
     try:
         data = resp.json()
     except ValueError:
