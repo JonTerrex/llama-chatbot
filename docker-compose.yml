@@ -72,7 +72,8 @@ services:
       # Usuario fijo de desarrollo: el cliente nunca lo manda (contrato de memoria, 4.1)
       - DEV_USER_ID=dev-user
       # Mensajes de historial que se leen por pedido (máximo 200)
-      - MEMORY_HISTORY_LIMIT=20
+      # 8 y no 20: el contexto útil de llama-local es ~1900-2500 tokens y 20 mensajes lo desbordan
+      - MEMORY_HISTORY_LIMIT=8
       # Debe ser MAYOR que POOL_TIMEOUT_S de la memoria (4 s): con 1 s de margen, la memoria
       # alcanza a contestar su 503 antes del corte (contrato de memoria, 3.5)
       - MEMORY_TIMEOUT_S=5
