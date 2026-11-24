@@ -109,10 +109,16 @@ Formato de OpenAI más una extensión opcional. ✅ Los cuatro campos `message`,
 | Petición mal formada | 400 | `invalid_request` |
 | `model` desconocido | 404 | `model_not_found` |
 | Proveedor marcado como caído o cargando | 503 | `provider_unavailable` |
-| Falla la conexión o respuesta inválida del proveedor | 502 | `provider_error` |
+| El proveedor responde `400` con `context_length_exceeded` | 400 | `context_length_exceeded` (`type: "invalid_request_error"`, `param: "messages"`) |
+| Con memoria, el system y el mensaje nuevo no entran aunque se descarte todo el historial (lo detecta el orquestador, sin llamar al proveedor; ver contrato de memoria, 4.2) | 400 | `context_length_exceeded` |
+| El proveedor responde `503` con `insufficient_vram` o `provider_unavailable` | 503 | el mismo `code` (`type: "provider_error"`) |
+| El proveedor responde `500` con `inference_error` | 502 | `provider_error` (el `code` del proveedor va en el mensaje) |
+| Falla la conexión o respuesta inválida del proveedor; cualquier otro estado no-2xx, un par (estado, `code`) que no coincide con los de arriba, o un cuerpo de error que no es JSON | 502 | `provider_error` |
 | El proveedor no responde a tiempo | 504 | `provider_timeout` |
 
 - ⚠️ La tabla de códigos es **propuesta propia**. 502 y 503 coinciden con la práctica de OpenRouter, pero no es un estándar de OpenAI.
+- **Errores del proveedor que el orquestador propaga** ⚠️: solo los pares (estado, `code`) de una lista blanca fija: `400 context_length_exceeded` y `503 insufficient_vram` / `provider_unavailable`. Del cuerpo del proveedor se lee **únicamente** `error.code`; `message`, `param`, `type` y `x_provider.state` nunca llegan al cliente ni al log. El mensaje al cliente lo arma el orquestador, y `x_provider` lleva solo `{"name": <modelo>}`. Se registra un WARNING con el modelo, el estado y el `code`; un `code` fuera de la lista no se loguea, porque es texto del proveedor. Con `x_conversation_id`, un error del proveedor no guarda nada (contrato de memoria, 4.2 paso 4).
+- El `400 context_length_exceeded` que genera el propio orquestador al recortar el historial (fila de arriba) usa el mismo `code`, `type` y `param` que el propagado, pero **no** lleva `x_provider`: el proveedor no llegó a recibir el pedido.
 - `type`: `invalid_request_error` para peticiones mal formadas ✅ (valor que OpenAI devuelve en sus errores reales) y `provider_error` para fallos del proveedor ⚠️ (convención propia).
 - `param` nombra el campo que falló (por ejemplo `messages`) o es `null`; nunca una posición dentro del cuerpo. Con JSON no parseable, FastAPI informa la posición del fallo y el mock la descarta (cubierto por test).
 - Rutas o métodos inexistentes (404/405) usan el mismo objeto `error`, con `code: null` ✅ (OpenAI también devuelve `code: null` cuando no hay código).
@@ -131,7 +137,8 @@ Formato de OpenAI más una extensión opcional. ✅ Los cuatro campos `message`,
 
 ## 8. Selección de proveedor
 
-- El campo estándar `model` decide a qué proveedor va la petición, mediante un **registro en configuración** (nombre de modelo → URL del proveedor) escrito en un archivo **YAML** (`providers.yaml`) montado como volumen. Si falta `model`, se usa el modelo indicado en la variable de entorno `DEFAULT_MODEL`; si tampoco está definida, la respuesta es `400`. ❓ Estructura exacta del archivo (se define al implementar el orquestador).
+- El campo estándar `model` decide a qué proveedor va la petición, mediante un **registro en configuración** (nombre de modelo → URL del proveedor) escrito en un archivo **YAML** (`providers.yaml`) montado como volumen. Si falta `model`, se usa el modelo indicado en la variable de entorno `DEFAULT_MODEL`; si tampoco está definida, la respuesta es `400`.
+- Estructura de `providers.yaml`: una clave `providers` con un mapa nombre de modelo → entrada. Cada entrada tiene `url` (obligatoria, `http://` o `https://`; se guarda sin barra final) y `context_tokens` (opcional). `context_tokens` es un entero ≥ 1 (se rechazan bool, `null`, cadenas y decimales): el tope de prompt + `max_tokens` que usa el orquestador para recortar el historial de memoria (contrato de memoria, 4.2). Sin la clave, el historial no se recorta. Un registro inválido impide arrancar al orquestador. Hoy `llama3-8b-local` declara `context_tokens: 1800` y `mock` no declara nada.
 - `GET /v1/models` devuelve **solo los proveedores activos** en formato lista de OpenAI (`object: "list"`, `data: [...]`). La UI lo usa para el selector y para ofrecer un cambio de modelo cuando uno falla.
 - Restricción de hardware: con ~5.9 GB de VRAM pico para Llama 3 8B en 4 bits sobre 8 GB, dos proveedores de GPU de ese tamaño probablemente no caben a la vez (inferencia a partir de medidas del autor, sin probar). El registro puede contener proveedores configurados pero no arrancados.
 
@@ -152,12 +159,44 @@ Formato de OpenAI más una extensión opcional. ✅ Los cuatro campos `message`,
 - **Nunca para producción:** `x_debug` y el endpoint exponen la conversación completa.
 - Quitar `x_debug` y `/debug/requests` no debe cambiar el comportamiento estándar.
 
+## 10b. Proveedor llama-local (GPU)
+
+Servicio propio (`src/providers/llama_local/`, imagen `Dockerfile.llama`, profile `llama` en `docker-compose.gpu.yml`, publicado solo en `127.0.0.1:8004`): Llama 3 8B en 4 bits (NF4) sobre GPU. Cumple este contrato **sin streaming** y sin `x_debug`. No agrega system prompt: genera con los `messages` que recibe.
+
+- **`/health`:** `200 {"status": "ready"}` con el modelo cargado; `503` con `{"status": "loading"}` mientras carga, en un hilo aparte, y con `{"status": "failed"}` si la carga falló (el motivo queda en el log). **No hay fallback a CPU:** sin CUDA o con menos de 5 GB de VRAM libre al arrancar, el estado queda `failed`. En compose, `restart: "no"`, para que no se reinicie en bucle.
+- **Calentamiento:** al terminar la carga, una generación corta y fija (8 tokens) antes de medir la VRAM, para que su consumo ya esté descontado del tope y el primer pedido real no pague el arranque. Si falla, el estado queda `failed`.
+- **Tope de contexto (prompt + `max_tokens`)** ⚠️: se calcula **una sola vez**, al terminar la carga, a partir de la VRAM libre de ese momento. Presupuesto = libre + caché reutilizable de PyTorch − margen de 256 MiB − reserva por pedido de 150 MiB, a ~0,25 MiB por token, sin pasar del contexto del modelo (8192). Si después se libera VRAM, el tope no sube hasta reiniciar el proveedor. `CONTEXTO_MAX_TOKENS` solo puede achicarlo. Es una estimación conservadora, no una garantía. Rango medido por el autor: 1938 a 3234 tokens según la VRAM libre al arrancar; 2527 en la prueba en vivo del 2026-11-24. Además, el proceso tiene un límite de VRAM (`set_per_process_memory_fraction`), para que un exceso dé OOM en vez de derramarse a la RAM del sistema.
+- **Validaciones** (fallan con `400 invalid_request`, `type: "invalid_request_error"`): `model` es obligatorio, `messages` tiene al menos un mensaje, `temperature` va de 0 a 2 y `max_tokens` es ≥ 1. Sin valores, se usan `temperature` 0,6 y `max_tokens` 256; `temperature` 0 significa greedy. Los parámetros no soportados se ignoran, como en la sección 3.
+
+| Situación | HTTP | `code` |
+|---|---|---|
+| `stream: true` (se evalúa antes que el estado) | 501 | `streaming_not_supported` |
+| Estado distinto de `ready`; `x_provider` = `{"name", "state": "loading" \| "failed"}` | 503 | `provider_unavailable` |
+| Prompt + `max_tokens` superan el tope de contexto (`param: "messages"`) | 400 | `context_length_exceeded` |
+| OOM **real** al generar (no hay verificación previa por pedido); se devuelve la VRAM antes de responder | 503 | `insufficient_vram` |
+| Cualquier otra excepción al generar (el log lleva solo la clase de la excepción) | 500 | `inference_error` |
+
+- **Una generación a la vez:** un lock serializa las generaciones, porque la GPU no tiene VRAM para dos. `x_metrics.latency_s` se mide **dentro del lock**: tokenización más generación, sin la espera en la cola (esa espera va al log como `espera_s`).
+- **`x_metrics.tokens_per_s`** = `completion_tokens` / duración de `model.generate`: **incluye el prefill** del prompt, no la tokenización. Se omite si esa duración, redondeada a milisegundos, vale 0. También envía `vram_peak_mb` y `vram_reserved_mb`.
+- **Variables de entorno**, leídas al arrancar; un valor inválido impide arrancar el servicio:
+  - `MODEL_PATH`: por defecto `modelos/llama3`.
+  - `TOP_P`: por defecto 0,9; mayor que 0 y como máximo 1.
+  - `LOG_LEVEL`: por defecto `INFO`. ⚠️ Con `DEBUG` se imprimen los tracebacks de las fallas de generación, que pueden incluir texto del usuario.
+  - `CONTEXTO_MAX_TOKENS`: entero > 0; vacío significa automático.
+- ⚠️ **Limitación conocida:** bajo WSL2/WDDM, `mem_get_info` no ve la VRAM que usan otros procesos, y la VRAM puede derramarse a la RAM del sistema sin que se detecte. Por eso se retiró la verificación de VRAM por pedido: con ±200 MiB de ruido entre lecturas consecutivas, 9 pedidos idénticos en el tope dieron 5 rechazos falsos y ningún OOM real. Si otro proceso toma VRAM después del arranque, la protección es el límite de proceso más el `503 insufficient_vram`.
+- ❓ **No verificado:**
+  - el `503 insufficient_vram` por HTTP: solo está cubierto por tests; el OOM real se provocó llamando al motor directamente;
+  - Linux nativo (solo se probó Windows con WSL2);
+  - el derrame de VRAM por WDDM con un juego u otra aplicación pesada abierta de verdad.
+
 ## 11. Pendientes
 
 - ❓ Estados posibles en `x_provider.state` (hoy: `down`, `loading`, `timeout`).
 - ❓ Si los errores en mitad de un stream añaden también `finish_reason: "error"`, como hace OpenRouter.
 - ❓ Qué errores cuentan como "proveedor caído" para la marca pasiva (sección 7) y cuáles son errores normales de la petición.
-- ❓ Estructura del archivo `providers.yaml` (sección 8).
+- Estructura de `providers.yaml` (sección 8): por proveedor, `url` (obligatoria) y `context_tokens` (opcional, entero ≥ 1; se rechazan bool, `null` y cadenas). Es el tope de prompt + `max_tokens` con el que el orquestador recorta el historial de memoria; sin la clave no se recorta.
+- ❓ `503 provider_unavailable` no distingue `loading` de `failed` cuando llega al cliente (el orquestador no copia `x_provider.state`) ni trae `Retry-After`: el cliente no sabe si reintentar ni cuándo.
+- ❓ El orquestador no valida `max_tokens` ≤ 0: lo reenvía, el proveedor lo rechaza con un `400 invalid_request` y el cliente recibe `502 provider_error`. Además, un valor negativo agranda el presupuesto del recorte de memoria.
 - ❓ Qué reenvía el orquestador al cliente cuando este no pidió `include_usage` (sección 5).
 - ⚠️ Compatibilidad con clientes externos: hoy `content` debe ser texto y los roles se limitan a `system`, `user` y `assistant`; un `content` en forma de lista de partes o los roles `developer`/`tool` devuelven `400`.
 - ❓ Traducción de este documento al inglés (el repo es de portfolio): se hará cuando la especificación se estabilice; por ahora, español.
@@ -175,3 +214,10 @@ Formato de OpenAI más una extensión opcional. ✅ Los cuatro campos `message`,
 | Campos extra tolerados por el SDK `openai` | ⚠️ circunstancial | OpenRouter añade campos propios y recomienda ese SDK; no hay prueba directa |
 | Formato de error en mitad del stream | ⚠️ convención | OpenRouter; no hay formato oficial confirmado |
 | Página oficial de OpenAI | ❌ no verificada | `platform.openai.com` no estaba en la lista de sitios permitidos del entorno de trabajo (2026-11-05). Las fuentes de arriba son de OpenAI pero secundarias; contrastar al implementar el streaming |
+
+**Verificación en vivo (2026-11-24)** ✅, con orquestador, memoria, PostgreSQL y llama-local en Docker con GPU (tope de contexto de 2527 en esa corrida; `context_tokens` declarado: 1800):
+- Un pedido mientras el proveedor cargaba (`/health` 503 `loading`) recibió `503 provider_unavailable` con `x_provider.name`.
+- 14 turnos con memoria dieron 14/14 con `200`.
+- Un pedido de unos 2800 tokens estimados recibió `400 context_length_exceeded` del orquestador, sin que el proveedor recibiera el pedido.
+
+❓ Fue una sola corrida, con un solo tope de contexto.
