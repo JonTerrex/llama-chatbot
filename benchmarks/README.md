@@ -162,7 +162,7 @@ También lee `nvidia-smi`. El allocator lo fija la imagen (`expandable_segments`
 
 - **Conclusión:** tras el OOM, la asignada vuelve exactamente al reposo (5748,6). La reservada queda en 5802,0, por debajo del reposo (5906,0) y de los 6304,0 del paso 3g. Con 4 OOM seguidos no crece nada.
 - ⚠️ **`nvidia-smi` es absoluto:** incluye las demás aplicaciones de Windows. La primera corrida tenía más VRAM ocupada por otros procesos (7557 contra 6873 MiB en reposo), y por eso su tope salió en 1759.
-- ⚠️ **Rango del tope:** 1759 queda **por debajo** del rango "1938 a 3234" que citan `docs/contrato-proveedores.md` y el comentario de `providers.yaml`. Con la fórmula actual, los topes con salida cruda en esta carpeta son 1759, 1938 y 2215; el 2527 de la prueba en vivo está solo en el reporte de la sesión (sección 5).
+- ⚠️ **Rango del tope:** 1759 es el extremo inferior del rango medido, **1759 a 3234**, que citan el comentario de `providers.yaml` y `docs/contrato-proveedores.md` (este último es un documento local, no versionado). Con la fórmula actual, los topes con salida cruda en esta carpeta son 1759, 1938 y 2215; el 2527 de la prueba en vivo está solo en el reporte de la sesión (sección 5).
 
 ## 5. Orquestador contra los servicios reales (R1 a R3)
 
@@ -214,7 +214,7 @@ Estos valores se citan en la documentación o en el código, pero no tienen sali
 |---|---|---|
 | Carga en frío de 120 a 375 s | Sesión, y el comentario de `docker-compose.gpu.yml` ("de 194 a 375 s") | Solo 122,0 a 169,0 s (sección 1); 120,4 s solo en el reporte de la sección 5 |
 | Generación de 22 a 28 tokens/s | Sesión | De 23,38 a 27,98 tokens/s en las secciones 3, 4 y 5 |
-| Tope de contexto de 1938 a 3234 tokens | `docs/contrato-proveedores.md`, `providers.yaml` | Con la fórmula actual: 1759, 1938 y 2215 (secciones 3 y 4). El 3234 es de la sección 1, con la fórmula anterior. Ver la advertencia de la sección 4 |
+| Tope de contexto de 1759 a 3234 tokens | `providers.yaml`, `docs/contrato-proveedores.md` (documento local, no versionado) | Con la fórmula actual: 1759, 1938 y 2215 (secciones 3 y 4). El 3234 es de la sección 1, con la fórmula anterior. Ver la advertencia de la sección 4 |
 | 10 de 10 en el tope (X1) y X2 | Sesión, paso 3g | No (sección 2) |
 | 5 rechazos falsos en 9 pedidos (paso 3f) | Comentario de `engine.py` | No |
 
