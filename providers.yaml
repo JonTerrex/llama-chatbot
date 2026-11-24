@@ -4,4 +4,4 @@ providers:
   llama3-8b-local:
     url: http://llama-local:8000
     # Conservador: el tope real del proveedor varía entre 1759 y 3234 según la VRAM libre al arrancar
-    context_tokens: 1800
+    context_tokens: 1700
