@@ -46,6 +46,29 @@ def niveles_de_loggers_http():
         logging.getLogger(nombre).setLevel(nivel)
 
 
+@pytest.fixture(autouse=True)
+def logger_del_orquestador(caplog, monkeypatch):
+    """
+    El lifespan llama a configurar_logging(), que deja "orchestrator" con propagate=False: sus
+    registros (y los de "orchestrator.memory", que propagan hasta él) ya no llegan al root, donde
+    caplog pone su handler. Por eso se agrega el handler de caplog directamente a este logger.
+    Al final se restauran handlers, nivel y propagate: el logger es global al proceso, y si
+    quedara propagate=False el resultado de un test dependería de cuáles corrieron antes.
+    """
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    log = logging.getLogger("orchestrator")
+    handlers, nivel, propaga = list(log.handlers), log.level, log.propagate
+    log.addHandler(caplog.handler)
+    yield log
+    for h in list(log.handlers):
+        if h not in handlers:
+            log.removeHandler(h)
+            if h is not caplog.handler:
+                h.close()
+    log.setLevel(nivel)
+    log.propagate = propaga
+
+
 class ProveedorFalso:
     """Handler del MockTransport: guarda cada body recibido y responde con `responder` (cada test lo cambia)."""
 
