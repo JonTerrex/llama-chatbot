@@ -2,26 +2,7 @@
 #version: "3.8"
 
 services:
-  # Microservicio del Backend (FastAPI)
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
-    ports:
-      - "8000:8000"
-    environment:
-      # true = respuestas simuladas sin GPU. Poner false con GPU y pesos en ./modelos
-      - USE_MOCK=true
-    # Si vas a usar GPU nativa en Linux/WSL2, descomenta estas líneas:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-
-  # Frontend (Streamlit): habla con el orquestador, no con la API vieja
+  # Frontend (Streamlit): habla con el orquestador
   client:
     build:
       context: .

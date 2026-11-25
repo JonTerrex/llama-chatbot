@@ -95,7 +95,7 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
 # ---------- Lógica del mock ----------
 
 def generar_texto(messages: list[dict]) -> str:
-    """Copia de src/mock_llm.generar_respuesta (sin importarla, para no depender del resto de src/)."""
+    """Copia de src/mock_llm.generar_respuesta (mock_llm.py retirado en el paso 4; ver git log; sin importarla, para no depender del resto de src/)."""
     ultimo_usuario = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
     turnos = sum(1 for m in messages if m["role"] == "user")
     return (

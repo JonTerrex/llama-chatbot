@@ -24,7 +24,7 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 
 # Solo src/memory (incluye schema.sql, que db.py lee al aplicar el esquema).
-# src/__init__.py se omite a propósito: importa src.chatbot, y sin él "src"
+# src/__init__.py se omite porque no hace falta (está vacío), y sin él "src"
 # funciona como paquete de espacio de nombres implícito.
 COPY src/memory/ /app/src/memory/
 

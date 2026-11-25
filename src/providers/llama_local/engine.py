@@ -6,7 +6,7 @@ bitsandbytes se importan solo dentro de MotorLlama (imports diferidos): importar
 módulo no requiere torch, y las funciones puras se prueban sin GPU.
 
 Autocontenido como el mock: la lógica de carga y generación es una copia adaptada de
-src/chatbot.py, sin importarla, para que la imagen del proveedor no dependa del resto de src/.
+src/chatbot.py (retirado en el paso 4; ver git log), sin importarla, para que la imagen del proveedor no dependa del resto de src/.
 """
 import gc
 import logging
@@ -19,7 +19,7 @@ logger = logging.getLogger("llama_local")
 
 TEMPERATURE_DEFAULT = 0.6
 MAX_TOKENS_DEFAULT = 256
-# Mismo umbral que chatbot.py: por debajo, Llama 3 8B en 4 bits no entra con margen.
+# Mismo umbral que chatbot.py (retirado en el paso 4; ver git log): por debajo, Llama 3 8B en 4 bits no entra con margen.
 VRAM_MIN_GB = 5.0
 
 MIB = 1024 ** 2
@@ -62,7 +62,7 @@ class ContextoExcedido(Exception):
 
 
 class SinGPU(Exception):
-    """No hay CUDA. A diferencia de chatbot.py no hay fallback a CPU: 8B en float32 no es usable."""
+    """No hay CUDA. A diferencia de chatbot.py (retirado en el paso 4; ver git log) no hay fallback a CPU: 8B en float32 no es usable."""
 
 
 class VRAMInsuficiente(Exception):
@@ -89,7 +89,7 @@ class VRAMInsuficiente(Exception):
 def resolver_parametros(temperature: Optional[float], max_tokens: Optional[int]) -> tuple[bool, float, int]:
     """
     (do_sample, temperature, max_new_tokens). Sin valores en la petición se usan los de
-    chatbot.py (0.6 y 256). temperature 0 significa greedy: transformers no admite
+    chatbot.py, retirado en el paso 4 (ver git log): 0.6 y 256. temperature 0 significa greedy: transformers no admite
     muestrear con temperatura 0, y "0" en la API de OpenAI es "lo más determinista posible".
     """
     t = TEMPERATURE_DEFAULT if temperature is None else float(temperature)
@@ -191,7 +191,7 @@ class MotorLlama:
         self.contexto_max: Optional[int] = None
 
     def cargar(self) -> None:
-        """Carga tokenizador y modelo en GPU con cuantización NF4 (mismos parámetros que chatbot.py)."""
+        """Carga tokenizador y modelo en GPU con cuantización NF4 (mismos parámetros que chatbot.py, retirado en el paso 4; ver git log)."""
         import torch
 
         # Chequeos antes de importar transformers: fallan rápido y se prueban con un torch falso.

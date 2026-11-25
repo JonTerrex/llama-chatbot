@@ -1,25 +1,7 @@
 services:
-  api:
-    image: llama-chatbot-api-gpu
-    build:
-      args:
-        UV_GROUP: gpu
-    environment:
-      - USE_MOCK=false
-      - PYTHONUNBUFFERED=1
-    volumes:
-      - ./modelos:/app/modelos:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
   # Proveedor Llama 3 8B en GPU (4 bits). Con profile propio "llama" (ver abajo).
   llama-local:
-    # Temporal: evita levantar api y llama-local a la vez en una GPU de 8 GB. Se revisa al retirar api.
+    # La GPU es un recurso aparte: --profile dev no levanta este servicio; se pide con --profile llama.
     profiles: ["llama"]
     build:
       context: .

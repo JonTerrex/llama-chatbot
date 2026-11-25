@@ -24,8 +24,8 @@ WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
 
-# Solo el proveedor (es autocontenido). src/__init__.py se omite a propósito: importa
-# src.chatbot, y sin él "src" funciona como paquete de espacio de nombres implícito.
+# Solo el proveedor (es autocontenido). src/__init__.py se omite porque no hace falta:
+# está vacío, y sin él "src" funciona como paquete de espacio de nombres implícito.
 COPY src/providers/__init__.py /app/src/providers/__init__.py
 COPY src/providers/llama_local/ /app/src/providers/llama_local/
 
